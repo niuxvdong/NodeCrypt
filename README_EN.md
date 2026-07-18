@@ -1,5 +1,48 @@
 # NodeCrypt
 
+## Lightweight Windows Desktop App (Recommended)
+
+Every LAN user runs the same `NodeCrypt-Desktop.exe`; no Node.js, external browser, or separate database is needed. The app uses Go, Wails, and the system WebView2 runtime. The current executable is about 15 MB, substantially lighter than Electron.
+
+```powershell
+npm ci
+npm run build:desktop
+```
+
+The output is `release/NodeCrypt-Desktop.exe`. Distribute it to every user and allow private-network access when Windows Firewall asks. Each app advertises its embedded node over UDP multicast. The discovery view also shows local IPv4 addresses and accepts an `IP`, `IP:port`, or complete room share link for direct connection; a bare IP uses port `8788`. Users select the same node and directly enter a display name, room name, and room password; no account registration or login is required.
+
+Every app embeds the HTTP/WebSocket chat node and SQLite. Group text, images, and encrypted file volumes are stored both on the selected chat node and in each online desktop user's `%APPDATA%\NodeCrypt Desktop\nodecrypt.sqlite`. Local history is merged when the same room is reopened, even after selecting a different node, and complete group files can be downloaded again. Passwordless and password-protected rooms with the same name use separate history partitions and member channels. The room name and password must match exactly. Display names may differ, but an online display name cannot be duplicated in the same room. Private messages and private files remain session-only. Current Windows 10/11 systems normally include the required Microsoft Edge WebView2 Runtime.
+
+The discovery view keeps up to 12 recent rooms for quick re-entry. Room passwords are protected with Windows DPAPI for the current Windows user and are never stored as plaintext in `desktop.json`.
+
+A browser connecting by LAN IP does not need its own SQLite database. It requests client-encrypted history from the selected EXE node and decrypts it in the browser with the room password. The EXE merges node history with its own local SQLite copy. A new computer starts with an empty local database but can still load history held by the online node. Browser users lose access to that node's history while it is offline; EXE users retain messages previously synchronized locally.
+
+This remains a shared blind-relay design rather than serverless P2P: users discover each other automatically, but they must connect to the same online node for real-time chat. Each computer can still read its own local history while that node is offline. Back up the complete `%APPDATA%\NodeCrypt Desktop` directory when moving local data.
+
+Windows Firewall does not need to be disabled. On Windows 10/11, the desktop app first uses the system `Dnscache` DNS-SD/mDNS service to discover `_nodecrypt._tcp.local`, while UDP `42429` and manual IP entry remain available as fallbacks. The discovery view shows rule status, ports, scope, and the bound EXE path, with actions to add/update or remove the rules. After UAC consent, the app manages only TCP `8788-8807` and UDP `42429` inbound rules for this EXE, scoped to `LocalSubnet`; it never disables the firewall or elevates silently.
+
+## Portable Browser-Based Windows LAN EXE
+
+The repository can be packaged as a single Windows executable. End users do not need Node.js, npm, Nginx, or a separate database:
+
+```powershell
+npm ci
+npm run build:exe
+```
+
+The output is `release/NodeCrypt-LAN.exe`. When started, it:
+
+- Serves the web app, account API, and authenticated WebSocket on `0.0.0.0:8788`, trying later ports if necessary.
+- Opens the host browser and prints LAN URLs for other devices.
+- Provides registration, login, logout, and session validation. Account passwords and room passwords are separate.
+- Creates `NodeCrypt-Data/nodecrypt.sqlite` beside the EXE for accounts, sessions, and client-encrypted group history.
+
+LAN users only need a browser and the printed URL. Keep the host process running and allow private-network access in Windows Firewall. Back up the complete `NodeCrypt-Data` directory when moving the server.
+
+The generated EXE is unsigned, so Windows SmartScreen may show an unknown-publisher warning. Use your own Authenticode certificate before public distribution.
+
+The portable build uses LAN HTTP by default and includes a cryptographic fallback that does not require a secure browser context, so chat content remains client-encrypted. HTTP does not protect account login requests or authenticate the server. Use it only on a trusted private LAN and never forward its port to the public internet. Public use requires a trusted HTTPS reverse proxy.
+
 🌐 **[中文版 README](README.md)**
 
 ## 🚀 Deployment Instructions
@@ -31,6 +74,20 @@ Use `npm run deploy` to deploy to Cloudflare Workers.
 
 NodeCrypt is a truly end-to-end encrypted chat system that implements a complete zero-knowledge architecture. The entire system design ensures that servers, network intermediaries, and even system administrators cannot access any plaintext message content. All encryption and decryption operations are performed locally on the client side, with the server serving only as a blind relay for encrypted data.
 
+### Chat History
+
+- Group text and image messages are encrypted in the client with an AES-256-GCM key derived from the room password.
+- Cloudflare Workers use Durable Object SQLite; the self-hosted Node.js server stores data in `server/data/nodecrypt.sqlite` by default.
+- The server stores ciphertext only and cannot read usernames, messages, or images.
+- The latest 5000 messages are retained per room by default. Set `NODECRYPT_HISTORY_LIMIT` to adjust this for the Node.js server.
+- Group-file metadata, compressed volumes, and completion markers are stored as client ciphertext and can be reconstructed after re-entry. Private messages and private files remain session-only.
+
+The self-hosted server requires Node.js 22.5 or newer. Persist the database directory when using Docker:
+
+```bash
+docker run -d --name nodecrypt -p 80:80 -v nodecrypt-data:/app/server/data ghcr.io/shuaiplus/nodecrypt
+```
+
 ### System Architecture
 - **Frontend**: ES6+ modular JavaScript, no framework dependencies
 - **Backend**: Cloudflare Workers + Durable Objects
@@ -41,16 +98,16 @@ NodeCrypt is a truly end-to-end encrypted chat system that implements a complete
 
 ### Core Principles
 - **Server Blind Relay**: The server can never decrypt message content, only responsible for encrypted data relay
-- **No Database Storage**: The system does not use any persistent storage; all data exists only temporarily in memory
+- **Ciphertext Database**: SQLite stores only client-generated group-message ciphertext that the server cannot decrypt
 - **End-to-End Encryption**: Messages are encrypted from sender to receiver throughout the entire process; no intermediary can decrypt them
-- **Forward Secrecy**: Even if keys are compromised, historical messages cannot be decrypted because there are no historical messages at all
+- **Ephemeral Private Chat**: Private messages continue to use session keys and are not written to the history database
 - **Anonymous Communication**: Users do not need to register real identities; supports temporary anonymous chat
 - **Rich Experience**: Support for sending images and files, with optional themes and languages
 
 ### Privacy Protection Mechanisms
 
 - **Real-time Member Notifications**: The room online list is completely transparent; any member joining or leaving will notify all members in real-time
-- **No Historical Messages**: Newly joined users cannot see any historical chat records
+- **Encrypted Group History**: Users with the correct room password can decrypt stored group-chat history
 - **Private Chat Encryption**: Clicking on a user's avatar can initiate end-to-end encrypted private conversations that are completely invisible to other room members
 
 ### Room Password Mechanism

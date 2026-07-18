@@ -5,6 +5,8 @@
   "main": "worker/index.js",
   "scripts": {
     "build": "vite build",
+    "build:desktop": "node scripts/build-desktop.mjs",
+    "build:exe": "node scripts/build-exe.mjs",
     "dev": " wrangler dev",
     "deploy": " wrangler deploy",
     "publish": " wrangler publish",
@@ -24,6 +26,8 @@
   "devDependencies": {
     "autoprefixer": "^10.4.21",
     "cssnano": "^7.0.7",
+    "esbuild": "^0.25.12",
+    "postject": "^1.0.0-alpha.6",
     "terser": "^5.39.2",
     "vite": "^6.3.5",
     "wrangler": "^4.16.1"
@@ -31,6 +35,8 @@
   "dependencies": {
     "@dicebear/core": "^9.2.2",
     "@dicebear/micah": "^9.2.2",
+    "@noble/ciphers": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
     "aes-js": "^3.1.2",
     "buffer": "^6.0.3",
     "dompurify": "^3.2.6",
@@ -38,6 +44,7 @@
     "emoji-picker-element": "^1.26.3",
     "fflate": "^0.8.2",
     "js-chacha20": "^1.1.0",
-    "js-sha256": "^0.11.0"
+    "js-sha256": "^0.11.0",
+    "ws": "^8.18.3"
   }
 }

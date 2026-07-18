@@ -32,8 +32,30 @@ export class ChatRoom {  constructor(state, env) {
     
     this.config = {
       seenTimeout: 60000,
+	  historyPageSize: 50,
+	  historyMaxMessageBytes: 2 * 1024 * 1024,
+	  historyMaxResponseBytes: 6 * 1024 * 1024,
+	  historyLimitPerRoom: 5000,
       debug: false
     };
+
+	this.sql = state.storage.sql;
+	this.sql.exec(`
+	  CREATE TABLE IF NOT EXISTS rooms (
+		channel TEXT PRIMARY KEY,
+		auth_token TEXT NOT NULL,
+		created_at INTEGER NOT NULL
+	  );
+	  CREATE TABLE IF NOT EXISTS messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		payload TEXT NOT NULL,
+		UNIQUE(channel, message_id)
+	  );
+	  CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel, id DESC);
+	`);
     
     // Initialize RSA key pair
     this.initRSAKeyPair();
@@ -298,6 +320,10 @@ export class ChatRoom {  constructor(state, env) {
         this.handleClientMessage(clientId, decrypted);
       } else if (action === 'w') {
         this.handleChannelMessage(clientId, decrypted);
+	  } else if (action === 's') {
+		this.handleStoreHistory(clientId, decrypted);
+	  } else if (action === 'h') {
+		this.handleHistoryRequest(clientId, decrypted);
       }
 
     } catch (error) {
@@ -329,6 +355,110 @@ export class ChatRoom {  constructor(state, env) {
       logEvent('message-join', [clientId, error], 'error');
     }
   }
+
+	isHistoryEnvelope(envelope) {
+	  return (
+		isObject(envelope) &&
+		envelope.v === 1 &&
+		isString(envelope.i) &&
+		envelope.i.length <= 128 &&
+		Number.isSafeInteger(envelope.ts) &&
+		envelope.ts > 0 &&
+		isString(envelope.n) &&
+		envelope.n.length <= 64 &&
+		isString(envelope.c)
+	  );
+	}
+
+	historyTokenMatches(channel, token, createIfMissing = false) {
+	  if (!isString(token) || token.length < 32 || token.length > 128) return false;
+	  if (createIfMissing) {
+		this.sql.exec(
+		  `INSERT OR IGNORE INTO rooms (channel, auth_token, created_at) VALUES (?, ?, ?)`,
+		  channel,
+		  token,
+		  Date.now()
+		);
+	  }
+	  const rooms = Array.from(this.sql.exec(`SELECT auth_token FROM rooms WHERE channel = ?`, channel));
+	  if (rooms.length !== 1 || !isString(rooms[0].auth_token)) return false;
+	  const expected = rooms[0].auth_token;
+	  let difference = expected.length ^ token.length;
+	  for (let i = 0; i < Math.max(expected.length, token.length); i++) {
+		difference |= (expected.charCodeAt(i) || 0) ^ (token.charCodeAt(i) || 0);
+	  }
+	  return difference === 0;
+	}
+
+	handleStoreHistory(clientId, decrypted) {
+	  const client = this.clients[clientId];
+	  if (!client || !client.channel || !this.isHistoryEnvelope(decrypted.p) ||
+		!this.historyTokenMatches(client.channel, decrypted.k, true)) return;
+	  try {
+		const payload = JSON.stringify(decrypted.p);
+		if (new TextEncoder().encode(payload).byteLength > this.config.historyMaxMessageBytes) return;
+		this.sql.exec(
+		  `INSERT OR IGNORE INTO messages (channel, message_id, created_at, payload) VALUES (?, ?, ?, ?)`,
+		  client.channel,
+		  decrypted.p.i,
+		  decrypted.p.ts,
+		  payload
+		);
+		this.sql.exec(
+		  `DELETE FROM messages WHERE channel = ? AND id NOT IN (
+			 SELECT id FROM messages WHERE channel = ? ORDER BY id DESC LIMIT ?
+		   )`,
+		  client.channel,
+		  client.channel,
+		  this.config.historyLimitPerRoom
+		);
+	  } catch (error) {
+		logEvent('history-store', [clientId, error], 'error');
+	  }
+	}
+
+	handleHistoryRequest(clientId, decrypted) {
+	  const client = this.clients[clientId];
+	  if (!client || !client.channel || !isObject(decrypted.p)) return;
+	  try {
+		if (!this.historyTokenMatches(client.channel, decrypted.k)) {
+		  this.sendMessage(client.connection, encryptMessage({
+			a: 'h',
+			p: { m: [], b: null, x: false }
+		  }, client.shared));
+		  return;
+		}
+		const before = Number.isSafeInteger(decrypted.p.b) && decrypted.p.b > 0 ?
+		  decrypted.p.b : Number.MAX_SAFE_INTEGER;
+		const limit = Math.max(1, Math.min(Number(decrypted.p.l) || this.config.historyPageSize, 100));
+		const rows = Array.from(this.sql.exec(
+		  `SELECT id, payload FROM messages WHERE channel = ? AND id < ? ORDER BY id DESC LIMIT ?`,
+		  client.channel,
+		  before,
+		  limit + 1
+		));
+		const selected = [];
+		let responseBytes = 0;
+		for (const row of rows.slice(0, limit)) {
+		  const rowBytes = new TextEncoder().encode(row.payload).byteLength;
+		  if (selected.length > 0 && responseBytes + rowBytes > this.config.historyMaxResponseBytes) break;
+		  selected.push({ id: Number(row.id), payload: JSON.parse(row.payload) });
+		  responseBytes += rowBytes;
+		}
+		const nextBefore = selected.length > 0 ? selected[selected.length - 1].id : null;
+		const message = {
+		  a: 'h',
+		  p: {
+			m: selected.reverse().map((row) => ({ ...row.payload, s: row.id })),
+			b: nextBefore,
+			x: rows.length > selected.length
+		  }
+		};
+		this.sendMessage(client.connection, encryptMessage(message, client.shared));
+	  } catch (error) {
+		logEvent('history-load', [clientId, error], 'error');
+	  }
+	}
   // Handle client messages
   handleClientMessage(clientId, decrypted) {
     if (!isString(decrypted.p) || !isString(decrypted.c) || !this.clients[clientId].channel) {

@@ -35,9 +35,19 @@ export function getNewRoomData() {
 		myUserName: '',
 		chat: null,
 		messages: [],
+		historyMessageIds: new Set(),
+		historyBefore: { server: null, local: null },
+		historyHasMore: { server: false, local: false },
+		historyLoading: false,
+		historyInitialized: false,
+		historySourcesInitialized: new Set(),
+		historyNotices: new Set(),
+		historyFileAutoPages: { server: 0, local: 0 },
 		prevUserList: [],
 		knownUserIds: new Set(),
 		unreadCount: 0,
+		activeConversationId: 'group',
+		privateConversations: {},
 		privateChatTargetId: null,
 		privateChatTargetName: null
 	}
@@ -46,10 +56,25 @@ export function getNewRoomData() {
 // Switch to another room by index
 // 切换到指定索引的房间
 export function switchRoom(index) {
+	switchConversation(index, 'group')
+}
+
+export function switchConversation(index, conversationId = 'group') {
 	if (index < 0 || index >= roomsData.length) return;
 	activeRoomIndex = index;
 	const rd = roomsData[index];
-	if (typeof rd.unreadCount === 'number') rd.unreadCount = 0;
+	rd.activeConversationId = conversationId;
+	if (conversationId === 'group') {
+		rd.privateChatTargetId = null;
+		rd.privateChatTargetName = null;
+		rd.unreadCount = 0
+	} else {
+		const conversation = rd.privateConversations[conversationId];
+		if (!conversation) return switchConversation(index, 'group');
+		rd.privateChatTargetId = conversation.clientId || null;
+		rd.privateChatTargetName = conversation.name;
+		conversation.unreadCount = 0
+	}
 	const sidebarUsername = document.getElementById('sidebar-username');
 	if (sidebarUsername) sidebarUsername.textContent = rd.myUserName;
 	setSidebarAvatar(rd.myUserName);
@@ -79,8 +104,8 @@ export function renderRooms(activeId = 0) {
 	roomList.innerHTML = '';
 	roomsData.forEach((rd, i) => {
 		const div = createElement('div', {
-			class: 'room' + (i === activeId ? ' active' : ''),
-			onclick: () => switchRoom(i)
+			class: 'room group-conversation' + (i === activeId && rd.activeConversationId === 'group' ? ' active' : ''),
+			onclick: () => switchConversation(i, 'group')
 		});
 		const safeRoomName = escapeHTML(rd.roomName);
 		let unreadHtml = '';
@@ -88,8 +113,43 @@ export function renderRooms(activeId = 0) {
 			unreadHtml = `<span class="room-unread-badge">${rd.unreadCount>99?'99+':rd.unreadCount}</span>`
 		}
 		div.innerHTML = `<div class="info"><div class="title">#${safeRoomName}</div></div>${unreadHtml}`;
-		roomList.appendChild(div)
+		roomList.appendChild(div);
+		const conversations = Object.values(rd.privateConversations)
+			.sort((left, right) => (right.lastTimestamp || 0) - (left.lastTimestamp || 0));
+		for (const conversation of conversations) {
+			const privateDiv = createElement('div', {
+				class: 'room private-conversation' + (i === activeId && rd.activeConversationId === conversation.id ? ' active' : '') + (!conversation.clientId ? ' offline' : ''),
+				onclick: () => switchConversation(i, conversation.id)
+			});
+			const unread = conversation.unreadCount && !(i === activeId && rd.activeConversationId === conversation.id) ?
+				`<span class="room-unread-badge">${conversation.unreadCount > 99 ? '99+' : conversation.unreadCount}</span>` : '';
+			privateDiv.innerHTML = `<div class="conversation-symbol">@</div><div class="info"><div class="title">${escapeHTML(conversation.name)}</div><div class="lastmsg">${t('ui.private_chat', 'Private')} · #${safeRoomName}${conversation.clientId ? '' : ` · ${t('ui.offline', 'Offline')}`}</div></div>${unread}<button type="button" class="conversation-close" title="${t('ui.close_private', 'Close private chat')}" aria-label="${t('ui.close_private', 'Close private chat')}">×</button>`;
+			privateDiv.querySelector('.conversation-close').onclick = (event) => {
+				event.stopPropagation();
+				delete rd.privateConversations[conversation.id];
+				if (rd.activeConversationId === conversation.id) switchConversation(i, 'group');
+				else renderRooms(activeRoomIndex)
+			};
+			roomList.appendChild(privateDiv)
+		}
 	})
+}
+
+function privateConversationID(name) {
+	return `private:${String(name || '').trim().toLowerCase()}`
+}
+
+function ensurePrivateConversation(rd, targetId, targetName) {
+	const id = privateConversationID(targetName);
+	let conversation = rd.privateConversations[id];
+	if (!conversation) {
+		conversation = { id, name: targetName, clientId: targetId || null, unreadCount: 0, lastTimestamp: Date.now() };
+		rd.privateConversations[id] = conversation
+	} else {
+		conversation.name = targetName || conversation.name;
+		if (targetId) conversation.clientId = targetId
+	}
+	return conversation
 }
 
 // Join a room
@@ -111,9 +171,19 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 			setStatus('Node connection closed');
 			if (onResult && !closed) {
 				closed = true;
-				onResult(false)
+			onResult(false)
 			}
-		},		onServerSecured: () => {
+		},
+		onJoinRejected: (reason) => {
+			roomsData.splice(idx, 1);
+			activeRoomIndex = roomsData.length ? Math.min(idx, roomsData.length - 1) : -1;
+			renderRooms(activeRoomIndex);
+			if (onResult && !closed) {
+				closed = true;
+				onResult(false, reason)
+			}
+		},
+		onServerSecured: () => {
 			if (modal) modal.remove();
 			else {
 				const loginContainer = $id('login-container');
@@ -127,12 +197,22 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 				closed = true;
 				onResult(true)
 			}
-			addSystemMsg(t('system.secured', 'connection secured'))
+			const desktopApp = window.go && window.go.main && window.go.main.App;
+			if (desktopApp && typeof desktopApp.SaveRecentRoom === 'function') {
+				desktopApp.SaveRecentRoom(window.nodeCryptEndpoint || '', userName, roomName, password)
+					.catch((error) => console.warn('Unable to save recent room', error))
+			}
+			addSystemMsg(t('system.secured', 'connection secured'));
+			newRd.historyLoading = true;
+			chatInst.requestHistory().then((sent) => {
+				if (!sent) newRd.historyLoading = false
+			})
 		},
 		onClientSecured: (user) => handleClientSecured(idx, user),
 		onClientList: (list, selfId) => handleClientList(idx, list, selfId),
 		onClientLeft: (clientId) => handleClientLeft(idx, clientId),
-		onClientMessage: (msg) => handleClientMessage(idx, msg)
+		onClientMessage: (msg) => handleClientMessage(idx, msg),
+		onHistoryMessages: (page) => handleHistoryMessages(idx, page)
 	};
 	const chatInst = new window.NodeCrypt(window.config, callbacks);
 	chatInst.setCredentials(userName, roomName, password);
@@ -157,10 +237,11 @@ export function handleClientList(idx, list, selfId) {
 	list.forEach(u => {
 		rd.userMap[u.clientId] = u
 	});
-	rd.myId = selfId;
+	rd.myId = selfId || '__nodecrypt_self__';
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
-		renderMainHeader()
+		renderMainHeader();
+		renderRooms(activeRoomIndex)
 	}
 	rd.initCount = (rd.initCount || 0) + 1;
 	if (rd.initCount === 2) {
@@ -174,6 +255,12 @@ export function handleClientList(idx, list, selfId) {
 export function handleClientSecured(idx, user) {
 	const rd = roomsData[idx];
 	if (!rd) return;
+	const securedName = user.userName || user.username || user.name || '';
+	const existingConversation = rd.privateConversations[privateConversationID(securedName)];
+	if (existingConversation) {
+		existingConversation.clientId = user.clientId;
+		if (rd.activeConversationId === existingConversation.id) rd.privateChatTargetId = user.clientId
+	}
 	rd.userMap[user.clientId] = user;
 	const existingUserIndex = rd.userList.findIndex(u => u.clientId === user.clientId);
 	if (existingUserIndex === -1) {
@@ -183,7 +270,8 @@ export function handleClientSecured(idx, user) {
 	}
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
-		renderMainHeader()
+		renderMainHeader();
+		renderRooms(activeRoomIndex)
 	}
 	if (!rd.isInitialized) {
 		return
@@ -192,11 +280,13 @@ export function handleClientSecured(idx, user) {
 	if (isNew) {
 		rd.knownUserIds.add(user.clientId);		const name = user.userName || user.username || user.name || t('ui.anonymous', 'Anonymous');
 		const msg = `${name} ${t('system.joined', 'joined the conversation')}`;
-		rd.messages.push({
-			type: 'system',
-			text: msg
-		});
-		if (activeRoomIndex === idx) addSystemMsg(msg, true);
+			rd.messages.push({
+				type: 'system',
+				text: msg,
+				timestamp: Date.now(),
+				conversationId: 'group'
+			});
+			if (activeRoomIndex === idx && rd.activeConversationId === 'group') addSystemMsg(msg, true);
 		if (window.notifyMessage) {
 			window.notifyMessage(rd.roomName, 'system', msg)
 		}
@@ -208,9 +298,11 @@ export function handleClientSecured(idx, user) {
 export function handleClientLeft(idx, clientId) {
 	const rd = roomsData[idx];
 	if (!rd) return;
+	for (const conversation of Object.values(rd.privateConversations)) {
+		if (conversation.clientId === clientId) conversation.clientId = null
+	}
 	if (rd.privateChatTargetId === clientId) {
 		rd.privateChatTargetId = null;
-		rd.privateChatTargetName = null;
 		if (activeRoomIndex === idx) {
 			updateChatInputStyle()
 		}
@@ -220,14 +312,93 @@ export function handleClientLeft(idx, clientId) {
 	const msg = `${name} ${t('system.left', 'left the conversation')}`;
 	rd.messages.push({
 		type: 'system',
-		text: msg
+		text: msg,
+		timestamp: Date.now(),
+		conversationId: 'group'
 	});
-	if (activeRoomIndex === idx) addSystemMsg(msg, true);
+	if (activeRoomIndex === idx && rd.activeConversationId === 'group') addSystemMsg(msg, true);
 	rd.userList = rd.userList.filter(u => u.clientId !== clientId);
 	delete rd.userMap[clientId];
 	if (activeRoomIndex === idx) {
 		renderUserList(false);
-		renderMainHeader()
+		renderMainHeader();
+		renderRooms(activeRoomIndex)
+	}
+}
+
+// Merge decrypted SQLite history into the current in-memory room.
+export function handleHistoryMessages(idx, page) {
+	const rd = roomsData[idx];
+	if (!rd || !page || !Array.isArray(page.messages)) return;
+	const source = page.source === 'local' ? 'local' : 'server';
+	const chatArea = activeRoomIndex === idx ? $id('chat-area') : null;
+	const previousHeight = chatArea ? chatArea.scrollHeight : 0;
+	const loadingOlder = rd.historySourcesInitialized.has(source);
+	for (const msg of page.messages) {
+		if (!msg.messageId || rd.historyMessageIds.has(msg.messageId)) continue;
+		rd.historyMessageIds.add(msg.messageId);
+		const isMine = msg.userName === rd.myUserName;
+		if (msg.type && msg.type.startsWith('file_')) {
+			if (window.handleFileMessage && msg.data) {
+				window.handleFileMessage(msg.data, false, true, true)
+			}
+			if (msg.type !== 'file_start') continue;
+			rd.messages.push({
+				type: isMine ? 'me' : 'other',
+				text: msg.data,
+				userName: msg.userName,
+				avatar: msg.userName,
+				msgType: 'file',
+				timestamp: msg.timestamp,
+				messageId: msg.messageId,
+				conversationId: 'group'
+			});
+			continue
+		}
+		rd.messages.push({
+			type: isMine ? 'me' : 'other',
+			text: msg.data,
+			userName: msg.userName,
+			avatar: msg.userName,
+			msgType: msg.type || 'text',
+			timestamp: msg.timestamp,
+			messageId: msg.messageId,
+			conversationId: 'group'
+		})
+	}
+	rd.messages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+	rd.historyBefore[source] = page.before;
+	rd.historyHasMore[source] = page.hasMore === true;
+	rd.historySourcesInitialized.add(source);
+	rd.historyLoading = false;
+	rd.historyInitialized = true;
+	let notice = '';
+	if (page.status === 'password_mismatch') {
+		notice = source === 'local' ?
+			t('history.local_password_mismatch', '本机存在该房间的历史记录，但房间密码不一致') :
+			t('history.node_password_mismatch', '当前节点存在该房间的历史记录，但房间密码不一致')
+	} else if (page.status === 'query_failed' || page.status === 'unavailable') {
+		notice = source === 'local' ?
+			t('history.local_load_failed', '本机历史记录读取失败') :
+			t('history.node_load_failed', '当前节点历史记录读取失败')
+	} else if (page.decryptFailed > 0) {
+		notice = t('history.decrypt_failed', '部分历史记录无法解密，请确认房间密码未变更')
+	}
+	const noticeKey = `${source}:${page.status}:${page.decryptFailed > 0}`;
+	if (notice && !rd.historyNotices.has(noticeKey)) {
+		rd.historyNotices.add(noticeKey);
+		rd.messages.push({ type: 'system', text: notice, timestamp: Date.now(), conversationId: 'group' })
+	}
+	if (activeRoomIndex === idx) {
+		renderChatArea();
+		if (loadingOlder && chatArea) {
+			chatArea.scrollTop = Math.max(0, chatArea.scrollHeight - previousHeight)
+		}
+	}
+	if (window.hasIncompleteFileHistory && window.hasIncompleteFileHistory() && page.hasMore === true &&
+		Number.isFinite(page.before) && rd.historyFileAutoPages[source] < 12) {
+		rd.historyFileAutoPages[source]++;
+		setTimeout(() => rd.chat && rd.chat.requestHistory({ [source]: page.before }), 0)
 	}
 }
 
@@ -236,63 +407,64 @@ export function handleClientLeft(idx, clientId) {
 export function handleClientMessage(idx, msg) {
 	const newRd = roomsData[idx];
 	if (!newRd) return;
-
-	// Prevent processing own messages unless it's a private message sent to oneself
-	if (msg.clientId === newRd.myId && msg.userName === newRd.myUserName && !msg.type.includes('_private')) {
+	const incomingType = msg.type || 'text';
+	if (msg.clientId === newRd.myId && msg.userName === newRd.myUserName && !incomingType.includes('_private')) {
 		return;
 	}
+	if (msg.messageId) {
+		if (newRd.historyMessageIds.has(msg.messageId)) return;
+		newRd.historyMessageIds.add(msg.messageId)
+	}
 
-	let msgType = msg.type || 'text';
+	let msgType = incomingType;
+	let realUserName = msg.userName || msg.username;
+	if (!realUserName && msg.clientId && newRd.userMap[msg.clientId]) {
+		realUserName = newRd.userMap[msg.clientId].userName || newRd.userMap[msg.clientId].username || newRd.userMap[msg.clientId].name
+	}
+	realUserName = realUserName || t('ui.anonymous', 'Anonymous');
+	const isPrivate = msgType.includes('_private');
+	const privateConversation = isPrivate ? ensurePrivateConversation(newRd, msg.clientId, realUserName) : null;
+	const conversationId = privateConversation ? privateConversation.id : 'group';
+	const timestamp = msg.timestamp || Date.now();
+	if (privateConversation) privateConversation.lastTimestamp = timestamp;
+	const conversationActive = activeRoomIndex === idx && newRd.activeConversationId === conversationId;
 
-	// Handle file messages
 	if (msgType.startsWith('file_')) {
-		// Part 1: Update message history and send notifications (for 'file_start' type)
+		if (window.handleFileMessage && msg.data) {
+			window.handleFileMessage(msg.data, isPrivate, true)
+		}
 		if (msgType === 'file_start' || msgType === 'file_start_private') {
-			let realUserName = msg.userName;
-			if (!realUserName && msg.clientId && newRd.userMap[msg.clientId]) {
-				realUserName = newRd.userMap[msg.clientId].userName || newRd.userMap[msg.clientId].username || newRd.userMap[msg.clientId].name;
-			}
-			const historyMsgType = msgType === 'file_start_private' ? 'file_private' : 'file';
-			
+			const historyMsgType = isPrivate ? 'file_private' : 'file';
 			const fileId = msg.data && msg.data.fileId;
-			if (fileId) { // Only proceed if we have a fileId
+			if (fileId) {
 				const messageAlreadyInHistory = newRd.messages.some(
-					m => m.msgType === historyMsgType && m.text && m.text.fileId === fileId && m.userName === realUserName
+					m => m.msgType === historyMsgType && m.text && m.text.fileId === fileId && m.conversationId === conversationId
 				);
-
 				if (!messageAlreadyInHistory) {
 					newRd.messages.push({
 						type: 'other',
-						text: msg.data, // This is the file metadata object
+						text: msg.data,
 						userName: realUserName,
 						avatar: realUserName,
 						msgType: historyMsgType,
-						timestamp: (msg.data && msg.data.timestamp) || Date.now() 
+						timestamp,
+						messageId: msg.messageId || null,
+						conversationId
 					});
 				}
 			}
-
-			const notificationMsgType = msgType.includes('_private') ? 'private file' : 'file';
+			if (!conversationActive) {
+				if (privateConversation) privateConversation.unreadCount++;
+				else newRd.unreadCount++
+			}
+			const notificationMsgType = isPrivate ? 'private file' : 'file';
 			if (window.notifyMessage && msg.data && msg.data.fileName) {
-				window.notifyMessage(newRd.roomName, notificationMsgType, `${msg.data.fileName}`, realUserName);
+				window.notifyMessage(newRd.roomName, notificationMsgType, `${msg.data.fileName}`, realUserName)
 			}
 		}
-
-		// Part 2: Handle UI interaction (rendering in active room, or unread count in inactive room)
-		if (activeRoomIndex === idx) {
-			// If it's the active room, delegate to util.file.js to handle UI and file transfer state.
-			// This applies to all file-related messages (file_start, file_volume, file_end, etc.)
-			if (window.handleFileMessage) {
-				window.handleFileMessage(msg.data, msgType.includes('_private'));
-			}
-		} else {
-			// If it's not the active room, only increment unread count for 'file_start' messages.
-			if (msgType === 'file_start' || msgType === 'file_start_private') {
-				newRd.unreadCount = (newRd.unreadCount || 0) + 1;
-				renderRooms(activeRoomIndex);
-			}
-		}
-		return; // File messages are fully handled.
+		if (conversationActive && (msgType === 'file_start' || msgType === 'file_start_private')) renderChatArea();
+		renderRooms(activeRoomIndex);
+		return
 	}
 
 	// Handle image messages (both new and legacy formats)
@@ -306,29 +478,24 @@ export function handleClientMessage(idx, msg) {
 			msgType = 'image';
 		}
 	}
-	let realUserName = msg.userName;
-	if (!realUserName && msg.clientId && newRd.userMap[msg.clientId]) {
-		realUserName = newRd.userMap[msg.clientId].userName || newRd.userMap[msg.clientId].username || newRd.userMap[msg.clientId].name;
-	}
-
-	// Add message to messages array for chat history
 	roomsData[idx].messages.push({
 		type: 'other',
 		text: msg.data,
 		userName: realUserName,
 		avatar: realUserName,
 		msgType: msgType,
-		timestamp: Date.now()
+		timestamp,
+		messageId: msg.messageId || null,
+		conversationId
 	});
-
-	// Only add message to chat display if it's for the active room
-	if (activeRoomIndex === idx) {
+	if (conversationActive) {
 		if (window.addOtherMsg) {
-			window.addOtherMsg(msg.data, realUserName, realUserName, false, msgType);
+			window.addOtherMsg(msg.data, realUserName, realUserName, false, msgType, timestamp)
 		}
 	} else {
-		roomsData[idx].unreadCount = (roomsData[idx].unreadCount || 0) + 1;
-		renderRooms(activeRoomIndex);
+		if (privateConversation) privateConversation.unreadCount++;
+		else newRd.unreadCount++;
+		renderRooms(activeRoomIndex)
 	}
 
 	const notificationMsgType = msgType.includes('_private') ? `private ${msgType.split('_')[0]}` : msgType;
@@ -342,15 +509,8 @@ export function handleClientMessage(idx, msg) {
 export function togglePrivateChat(targetId, targetName) {
 	const rd = roomsData[activeRoomIndex];
 	if (!rd) return;
-	if (rd.privateChatTargetId === targetId) {
-		rd.privateChatTargetId = null;
-		rd.privateChatTargetName = null
-	} else {
-		rd.privateChatTargetId = targetId;
-		rd.privateChatTargetName = targetName
-	}
-	renderUserList();
-	updateChatInputStyle()
+	const conversation = ensurePrivateConversation(rd, targetId, targetName);
+	switchConversation(activeRoomIndex, conversation.id)
 }
 
 

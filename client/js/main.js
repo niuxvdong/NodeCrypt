@@ -31,6 +31,7 @@ import {
 	notifyMessage         // 通知信息提示 / Display notification message
 } from './util.settings.js';
 import { t, updateStaticTexts } from './util.i18n.js';
+import { initAccountGate, logoutAccount, getAuthenticatedUser } from './util.auth.js';
 
 // 从 util.theme.js 中导入主题功能函数
 // Import theme functions from util.theme.js
@@ -80,10 +81,46 @@ import {	renderUserList,       // 渲染用户列表 / Render user list
 	initFlipCard          // 初始化翻转卡片功能 / Initialize flip card functionality
 } from './ui.js';
 
+function getDesktopNodeEndpoint() {
+	const value = new URLSearchParams(window.location.search).get('_node');
+	if (!value) return window.location.origin;
+	try {
+		const endpoint = new URL(value);
+		if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') return window.location.origin;
+		return endpoint.origin
+	} catch (error) {
+		return window.location.origin
+	}
+}
+
+const nodeEndpoint = getDesktopNodeEndpoint();
+const nodeURL = new URL(nodeEndpoint);
+window.nodeCryptEndpoint = nodeEndpoint;
+
+async function enterDesktopRecentRoom(form) {
+	const recentID = new URLSearchParams(window.location.search).get('_recent');
+	const desktopApp = window.go && window.go.main && window.go.main.App;
+	if (!recentID || !form || !desktopApp || typeof desktopApp.GetRecentRoom !== 'function') return;
+	try {
+		const recent = await desktopApp.GetRecentRoom(recentID);
+		if (!recent || recent.found !== true) return;
+		const userInput = $id('userName');
+		const roomInput = $id('roomName');
+		const passwordInput = $id('password');
+		if (!userInput || !roomInput || !passwordInput) return;
+		userInput.value = recent.userName || '';
+		roomInput.value = recent.roomName || '';
+		passwordInput.value = recent.password || '';
+		form.requestSubmit()
+	} catch (error) {
+		console.warn('Unable to open recent room', error)
+	}
+}
+
 // 设置全局配置参数
 // Set global configuration parameters
 window.config = {
-	wsAddress: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`, // WebSocket 服务器地址 / WebSocket server address
+	wsAddress: `${nodeURL.protocol === 'https:' ? 'wss:' : 'ws:'}//${nodeURL.host}`, // WebSocket 服务器地址 / WebSocket server address
 	//wsAddress: `wss://crypt.works`,
 	debug: true                       // 是否开启调试模式 / Enable debug mode
 };
@@ -105,7 +142,8 @@ window.downloadFile = downloadFile;
 
 // 当 DOM 内容加载完成后执行初始化逻辑
 // Run initialization logic when the DOM content is fully loaded
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
+	await initAccountGate();
 	// 移除预加载样式类，允许过渡效果
 	// Remove preload class to allow transitions
 	setTimeout(() => {
@@ -138,6 +176,7 @@ window.addEventListener('DOMContentLoaded', () => {
 	// 初始化辅助功能和界面设置
 	// Initialize autofill, input placeholders, and menus
 	autofillRoomPwd();	setupInputPlaceholder();
+	await enterDesktopRecentRoom(loginForm);
 	setupMoreBtnMenu();
 	setupImagePreview();	setupEmojiPicker();
 	// 由于我们已经在DOM加载前预先初始化了语言设置，这里不需要重复初始化
@@ -164,6 +203,32 @@ window.addEventListener('DOMContentLoaded', () => {
 	// 点击其他地方时关闭设置面板 (已移除，因为现在使用侧边栏形式)
 	// Close settings panel when clicking outside (removed since we now use sidebar format)
 	const input = document.querySelector('.input-message-input'); // 消息输入框 / Message input box
+	const chatArea = $id('chat-area');
+	if (chatArea) {
+		chatArea.addEventListener('scroll', () => {
+			if (chatArea.scrollTop > 32) return;
+			const rd = roomsData[activeRoomIndex];
+			if (!rd || !rd.chat || rd.historyLoading) return;
+			const cursors = {};
+			for (const source of ['server', 'local']) {
+				if (rd.historyHasMore[source] && Number.isFinite(rd.historyBefore[source])) {
+					cursors[source] = rd.historyBefore[source]
+				}
+			}
+			if (!Number.isFinite(cursors.server) && !Number.isFinite(cursors.local)) return;
+			rd.historyLoading = true;
+			rd.chat.requestHistory(cursors).then((sent) => {
+				if (!sent) rd.historyLoading = false
+			})
+		})
+	}
+	const accountLogoutBtn = $id('account-logout-btn');
+	if (accountLogoutBtn && getAuthenticatedUser()) {
+		accountLogoutBtn.hidden = false;
+		accountLogoutBtn.textContent = t('auth.logout', 'Logout');
+		accountLogoutBtn.title = t('auth.logout', 'Logout');
+		accountLogoutBtn.onclick = logoutAccount
+	}
 	
 	// 设置图片粘贴功能
 	// Setup image paste functionality
@@ -199,7 +264,7 @@ window.addEventListener('DOMContentLoaded', () => {
 					images: images    // 包含所有图片数据
 				};
 
-				if (rd.privateChatTargetId) {
+				if (rd.activeConversationId !== 'group') {
 					// 私聊图片消息加密并发送
 					// Encrypt and send private image message
 					const targetClient = rd.chat.channel[rd.privateChatTargetId];
@@ -223,15 +288,15 @@ window.addEventListener('DOMContentLoaded', () => {
 				} else {
 					// 公共频道图片消息发送
 					// Send image message to public channel
-					rd.chat.sendChannelMessage('image', messageContent);
-					addMsg(messageContent, false, 'image');
+					const result = rd.chat.sendPersistentChannelMessage('image', messageContent);
+					addMsg(messageContent, false, 'image', result.timestamp, result.messageId);
 				}
 				
 				imagePasteHandler.clearImages(); // 清除所有图片预览
 			} else if (text) {
 				// 发送纯文本消息
 				// Send text-only message
-				if (rd.privateChatTargetId) {
+				if (rd.activeConversationId !== 'group') {
 					// 私聊消息加密并发送
 					// Encrypt and send private message
 					const targetClient = rd.chat.channel[rd.privateChatTargetId];
@@ -255,8 +320,8 @@ window.addEventListener('DOMContentLoaded', () => {
 				} else {
 					// 公共频道消息发送
 					// Send public message
-					rd.chat.sendChannelMessage('text', text);
-					addMsg(text);				}
+					const result = rd.chat.sendPersistentChannelMessage('text', text);
+					addMsg(text, false, 'text', result.timestamp, result.messageId);				}
 			}
 			
 			// 清空输入框并触发 input 事件
@@ -282,15 +347,24 @@ window.addEventListener('DOMContentLoaded', () => {
 		inputSelector: '.input-message-input', // 消息输入框选择器 / Message input selector
 		attachBtnSelector: '.chat-attach-btn', // 附件按钮选择器 / Attach button selector
 		fileInputSelector: '.new-message-wrapper input[type="file"]', // 文件输入框选择器 / File input selector
-		onSend: (message) => {
+		getContext: () => {
 			const rd = roomsData[activeRoomIndex];
+			return rd ? { roomIndex: activeRoomIndex, conversationId: rd.activeConversationId || 'group' } : null
+		},
+		onSend: (message, transferContext) => {
+			const roomIndex = transferContext && Number.isInteger(transferContext.roomIndex) ? transferContext.roomIndex : activeRoomIndex;
+			const rd = roomsData[roomIndex];
 			if (rd && rd.chat) {
 				const userName = rd.myUserName || '';
 				const msgWithUser = { ...message, userName };
-				if (rd.privateChatTargetId) {
+				const conversationId = transferContext ? transferContext.conversationId : (rd.activeConversationId || 'group');
+				const isPrivateTransfer = conversationId !== 'group';
+				const privateConversation = isPrivateTransfer ? rd.privateConversations[conversationId] : null;
+				const targetClientId = privateConversation ? privateConversation.clientId : null;
+				if (isPrivateTransfer) {
 					// 私聊文件加密并发送
 					// Encrypt and send private file message
-					const targetClient = rd.chat.channel[rd.privateChatTargetId];
+					const targetClient = rd.chat.channel[targetClientId];
 					if (targetClient && targetClient.shared) {
 						const clientMessagePayload = {
 							a: 'm',
@@ -301,25 +375,30 @@ window.addEventListener('DOMContentLoaded', () => {
 						const serverRelayPayload = {
 							a: 'c',
 							p: encryptedClientMessage,
-							c: rd.privateChatTargetId
+							c: targetClientId
 						};
 						const encryptedMessageForServer = rd.chat.encryptServerMessage(serverRelayPayload, rd.chat.serverShared);
 						rd.chat.sendMessage(encryptedMessageForServer);
 						
 						// 添加到自己的聊天记录
 						if (msgWithUser.type === 'file_start') {
-							addMsg(msgWithUser, false, 'file_private');
+							const timestamp = Date.now();
+							if (activeRoomIndex === roomIndex && rd.activeConversationId === conversationId) addMsg(msgWithUser, false, 'file_private', timestamp);
+							else rd.messages.push({ type: 'me', text: msgWithUser, msgType: 'file_private', timestamp, conversationId })
 						}					} else {
-						addSystemMsg(`${t('system.private_file_failed', 'Cannot send private file to')} ${rd.privateChatTargetName}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
+						if (activeRoomIndex === roomIndex && rd.activeConversationId === conversationId) {
+							addSystemMsg(`${t('system.private_file_failed', 'Cannot send private file to')} ${privateConversation ? privateConversation.name : ''}. ${t('system.user_not_connected', 'User might not be fully connected.')}`)
+						}
 					}
 				} else {
 					// 公共频道文件发送
 					// Send file to public channel
-					rd.chat.sendChannelMessage(msgWithUser.type, msgWithUser);
+					const result = rd.chat.sendPersistentChannelMessage(msgWithUser.type, msgWithUser);
 					
 					// 添加到自己的聊天记录
 					if (msgWithUser.type === 'file_start') {
-						addMsg(msgWithUser, false, 'file');
+						if (activeRoomIndex === roomIndex && rd.activeConversationId === 'group') addMsg(msgWithUser, false, 'file', result.timestamp, result.messageId);
+						else rd.messages.push({ type: 'me', text: msgWithUser, msgType: 'file', timestamp: result.timestamp, messageId: result.messageId, conversationId: 'group' })
 					}
 				}
 			}		}

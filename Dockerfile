@@ -1,6 +1,6 @@
-# Use a Node.js 18 Alpine base image for the backend builder
-# 使用 Node.js 18 Alpine 基础镜像作为后端构建器
-FROM node:18-alpine AS backend-builder
+# Use Node.js 22 for the built-in SQLite API
+# 使用 Node.js 22 内置 SQLite API
+FROM node:22-alpine AS backend-builder
 
 WORKDIR /app
 
@@ -17,7 +17,7 @@ COPY server/server.js ./server/
 
 # Frontend build stage
 # 前端构建阶段
-FROM node:18-alpine AS frontend-builder
+FROM node:22-alpine AS frontend-builder
 
 WORKDIR /app
 
@@ -37,14 +37,14 @@ COPY client/ ./client/
 # 构建前端
 RUN npm run build:docker
 
-# Second stage: Minimal image
-# 第二阶段：极小镜像
-FROM alpine:3.16
+# Runtime stage
+# 运行阶段
+FROM node:22-alpine
 
-# Install minimal Node.js and Nginx
-# 安装最小化版本的 Node.js 和 Nginx
-RUN apk add --no-cache nodejs nginx && \
-    mkdir -p /app/server /app/client /run/nginx && \
+# Install Nginx and create the persistent database directory
+# 安装 Nginx 并创建数据库持久化目录
+RUN apk add --no-cache nginx && \
+    mkdir -p /app/server/data /app/client /run/nginx && \
     # Clean up apk cache
     # 清理 apk 缓存
     rm -rf /var/cache/apk/*
@@ -130,6 +130,7 @@ http {
 EOF
 
 EXPOSE 80
+VOLUME ["/app/server/data"]
 
 # Set low memory environment variables and remove unsupported options
 # 设置低内存环境变量，去除不支持的选项

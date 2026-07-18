@@ -397,7 +397,7 @@ flex-direction: column;
 	border-bottom: 2px solid #ededed3b;
 	cursor: pointer;
 	background: #fff;
-	border-radius: 10px;
+	border-radius: 6px;
 	margin: 6px 8px;
 	box-sizing: border-box;
 	position: relative;
@@ -407,6 +407,70 @@ flex-direction: column;
 
 .room.active {
 	background: #7bc0ff;
+}
+
+.room.private-conversation {
+	min-height: 58px;
+	padding: 10px 12px;
+	border-left: 3px solid transparent;
+}
+
+.room.private-conversation.active {
+	border-left-color: #2f7d4d;
+	background: #e8f4ec;
+}
+
+.room.private-conversation.active:hover {
+	background: #e8f4ec;
+}
+
+.room.private-conversation.offline:not(.active) {
+	opacity: 0.68;
+}
+
+.conversation-symbol {
+	display: grid;
+	place-items: center;
+	flex: 0 0 auto;
+	width: 34px;
+	height: 34px;
+	margin-right: 10px;
+	border-radius: 4px;
+	background: #edf3ef;
+	color: #2f6f47;
+	font-size: 17px;
+	font-weight: 700;
+}
+
+.conversation-close {
+	display: grid;
+	place-items: center;
+	flex: 0 0 auto;
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	border: 0;
+	border-radius: 4px;
+	background: transparent;
+	color: #7d8991;
+	font-size: 19px;
+	line-height: 1;
+	opacity: 0;
+	cursor: pointer;
+}
+
+.private-conversation:hover .conversation-close,
+.private-conversation.active .conversation-close {
+	opacity: 1;
+}
+
+.conversation-close:hover {
+	background: #f7eaea;
+	color: #9f2525;
+}
+
+.private-conversation .room-unread-badge {
+	right: 48px;
 }
 
 .room.active:hover {
@@ -463,7 +527,7 @@ flex-direction: column;
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	letter-spacing: 0.5px;
+	letter-spacing: 0;
 	z-index: 2;
 	user-select: none;
 	pointer-events: none;
@@ -1068,6 +1132,22 @@ flex-direction: column;
 	transform: translateX(2px);
 }
 
+.member.me {
+	border: 1px solid #b9d9c5;
+	border-left: 4px solid #2f7d4d;
+	background: #f1f8f3;
+}
+
+.member.me:hover {
+	background: #e9f4ec;
+	transform: none;
+}
+
+.member.pending {
+	cursor: default;
+	opacity: 0.72;
+}
+
 .member .member-info {
 	flex: 1;
 }
@@ -1080,7 +1160,17 @@ flex-direction: column;
 
 .member .member-status {
 	font-size: 12px;
-	color: #30a8f7;
+	color: #687781;
+}
+
+.member-self-badge {
+	flex: 0 0 auto;
+	padding: 2px 7px;
+	border: 1px solid #9bc5aa;
+	border-radius: 4px;
+	color: #2f6f47;
+	font-size: 11px;
+	font-weight: 600;
 }
 
 .member-tip {

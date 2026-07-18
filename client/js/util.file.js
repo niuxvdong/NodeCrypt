@@ -2,6 +2,7 @@
 // 导入必要的模块
 import { deflate, inflate } from 'fflate';
 import { showFileUploadModal } from './util.fileUpload.js';
+import { sha256Hex } from './util.hash.js';
 
 // 分卷大小统一配置
 const DEFAULT_VOLUME_SIZE = 256 * 1024; // 512KB
@@ -9,6 +10,9 @@ const DEFAULT_VOLUME_SIZE = 256 * 1024; // 512KB
 // File transfer state management
 // 文件传输状态管理
 window.fileTransfers = new Map();
+window.fileHistoryPending = new Map();
+window.hasIncompleteFileHistory = () => window.fileHistoryPending.size > 0 ||
+	Array.from(window.fileTransfers.values()).some(transfer => transfer.fromHistory && transfer.status === 'receiving');
 
 // Base64 encoding for binary data (more efficient than hex)
 // Base64编码用于二进制数据（比十六进制更高效）
@@ -47,9 +51,7 @@ function generateFileId() {
 // Calculate SHA-256 hash for data integrity verification
 // 计算SHA-256哈希值用于数据完整性验证
 async function calculateHash(data) {
-	const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-	const hashArray = Array.from(new Uint8Array(hashBuffer));
-	return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+	return sha256Hex(data)
 }
 
 
@@ -347,7 +349,8 @@ export function setupFileSend({
 	inputSelector,
 	attachBtnSelector,
 	fileInputSelector,
-	onSend
+	onSend,
+	getContext
 }) {
 	const attachBtn = document.querySelector(attachBtnSelector);
 	
@@ -358,14 +361,15 @@ export function setupFileSend({
 			e.preventDefault();
 			e.stopPropagation();
 			
-			showFileUploadModal(async (files) => {
+		showFileUploadModal(async (files) => {
+				const transferContext = typeof getContext === 'function' ? getContext() : null;
 				// 传递 userName 给 onSend
 				const userName = window.roomsData && window.activeRoomIndex >= 0
 					? (window.roomsData[window.activeRoomIndex]?.myUserName || '')
 					: '';
 				await handleFilesUpload(files, (msg) => {
 					// 合并 userName 字段
-					onSend({ ...msg, userName });
+					onSend({ ...msg, userName }, transferContext);
 				});
 			});
 		});
@@ -612,12 +616,12 @@ function updateFileProgress(fileId) {
 
 // Handle incoming file messages
 // 处理接收到的文件消息
-export function handleFileMessage(message, isPrivate = false) {
+export function handleFileMessage(message, isPrivate = false, suppressDisplay = false, fromHistory = false) {
 	const { type, fileId, userName } = message;
 	
 	switch (type) {
 		case 'file_start':
-			handleFileStart(message, isPrivate);
+			handleFileStart(message, isPrivate, suppressDisplay, fromHistory);
 			break;
 		case 'file_volume':
 			handleFileVolume(message);
@@ -630,7 +634,7 @@ export function handleFileMessage(message, isPrivate = false) {
 
 // Handle file start message
 // 处理文件开始消息
-function handleFileStart(message, isPrivate) {
+function handleFileStart(message, isPrivate, suppressDisplay = false, fromHistory = false) {
 	const { fileId, fileName, originalSize, compressedSize, totalVolumes, originalHash, archiveHash, fileCount, fileManifest, isArchive, userName } = message;
 	
 	const fileTransfer = {
@@ -647,13 +651,29 @@ function handleFileStart(message, isPrivate) {
 		fileCount,
 		fileManifest,
 		isArchive,
-		userName // 记录发送者名字
+		userName, // 记录发送者名字
+		completeReceived: false,
+		fromHistory
 	};
 	
 	window.fileTransfers.set(fileId, fileTransfer);
+	const pending = window.fileHistoryPending.get(fileId);
+	if (pending) {
+		fileTransfer.completeReceived = pending.complete;
+		for (const [volumeIndex, volumeData] of pending.volumes) {
+			if (volumeIndex >= 0 && volumeIndex < fileTransfer.totalVolumes) {
+				fileTransfer.receivedVolumes.add(volumeIndex);
+				fileTransfer.volumeData[volumeIndex] = volumeData
+			}
+		}
+		if (pending.complete && fileTransfer.receivedVolumes.size === fileTransfer.totalVolumes) {
+			fileTransfer.status = 'completed'
+		}
+		window.fileHistoryPending.delete(fileId)
+	}
 	
 	// 添加文件消息到聊天
-	if (window.addOtherMsg) {
+	if (!suppressDisplay && window.addOtherMsg) {
 		let displayData;
 		if (isArchive) {
 			displayData = {
@@ -687,10 +707,17 @@ function handleFileVolume(message) {
 	const { fileId, volumeIndex, volumeData } = message;
 	const transfer = window.fileTransfers.get(fileId);
 	
-	if (!transfer) return;
+	if (!transfer) {
+		const pending = getPendingFileHistory(fileId);
+		pending.volumes.set(volumeIndex, volumeData);
+		return
+	}
 	
 	transfer.receivedVolumes.add(volumeIndex);
 	transfer.volumeData[volumeIndex] = volumeData;
+	if (transfer.completeReceived && transfer.receivedVolumes.size === transfer.totalVolumes) {
+		transfer.status = 'completed'
+	}
 	
 	updateFileProgress(fileId);
 }
@@ -701,7 +728,11 @@ function handleFileComplete(message) {
 	const { fileId } = message;
 	const transfer = window.fileTransfers.get(fileId);
 	
-	if (!transfer) return;
+	if (!transfer) {
+		getPendingFileHistory(fileId).complete = true;
+		return
+	}
+	transfer.completeReceived = true;
 	
 	// 检查是否所有分卷都已接收
 	if (transfer.receivedVolumes.size === transfer.totalVolumes) {
@@ -746,4 +777,13 @@ export function formatFileSize(bytes) {
 // 向后兼容的图片发送函数
 export function setupImageSend(config) {
 	setupFileSend(config);
+}
+
+function getPendingFileHistory(fileId) {
+	let pending = window.fileHistoryPending.get(fileId);
+	if (!pending) {
+		pending = { volumes: new Map(), complete: false };
+		window.fileHistoryPending.set(fileId, pending)
+	}
+	return pending
 }

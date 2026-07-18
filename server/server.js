@@ -3,6 +3,9 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { DatabaseSync } = require('node:sqlite');
 const ws = require('ws');
 
 // Generate a new RSA key pair
@@ -45,11 +48,60 @@ console.log('RSA key pair generated successfully');
 const config = {
 	rsaPrivate: keyPair.rsaPrivate,
 	rsaPublic: keyPair.rsaPublic,
-	wsHost: '127.0.0.1',
-	wsPort: 8088,
+	wsHost: process.env.NODECRYPT_WS_HOST || '127.0.0.1',
+	wsPort: Number(process.env.NODECRYPT_WS_PORT) || 8088,
 	seenTimeout: 60000,
+	historyPageSize: 50,
+	historyMaxMessageBytes: 2 * 1024 * 1024,
+	historyMaxResponseBytes: 6 * 1024 * 1024,
+	historyLimitPerRoom: Math.max(100, Number(process.env.NODECRYPT_HISTORY_LIMIT) || 5000),
+	databasePath: process.env.NODECRYPT_DB_PATH || path.join(__dirname, 'data', 'nodecrypt.sqlite'),
 	debug: false
 };
+
+fs.mkdirSync(path.dirname(config.databasePath), { recursive: true });
+const historyDb = new DatabaseSync(config.databasePath);
+historyDb.exec(`
+	PRAGMA journal_mode = WAL;
+	PRAGMA synchronous = NORMAL;
+	CREATE TABLE IF NOT EXISTS rooms (
+		channel TEXT PRIMARY KEY,
+		auth_token TEXT NOT NULL,
+		created_at INTEGER NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		channel TEXT NOT NULL,
+		message_id TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		payload TEXT NOT NULL,
+		UNIQUE(channel, message_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_messages_channel_id ON messages(channel, id DESC);
+`);
+const insertRoomStatement = historyDb.prepare(`
+	INSERT OR IGNORE INTO rooms (channel, auth_token, created_at) VALUES (?, ?, ?)
+`);
+const selectRoomStatement = historyDb.prepare(`
+	SELECT auth_token FROM rooms WHERE channel = ?
+`);
+const insertHistoryStatement = historyDb.prepare(`
+	INSERT OR IGNORE INTO messages (channel, message_id, created_at, payload)
+	VALUES (?, ?, ?, ?)
+`);
+const selectHistoryStatement = historyDb.prepare(`
+	SELECT id, payload FROM messages
+	WHERE channel = ? AND id < ?
+	ORDER BY id DESC
+	LIMIT ?
+`);
+const pruneHistoryStatement = historyDb.prepare(`
+	DELETE FROM messages
+	WHERE channel = ? AND id NOT IN (
+		SELECT id FROM messages WHERE channel = ? ORDER BY id DESC LIMIT ?
+	)
+`);
+console.log('history database ready', config.databasePath);
 
 
 const wss = new ws.Server({
@@ -125,9 +177,11 @@ wss.on('connection', (connection) => {
 
 
 
-	connection.on('message', (message) => {
+	connection.on('message', (message, isBinary) => {
+		if (!isBinary && Buffer.isBuffer(message)) message = message.toString('utf8');
 
 		if (
+			isBinary ||
 			!isString(message) ||
 			!clients[clientId]
 		) {
@@ -285,6 +339,10 @@ const processEncryptedMessage = (clientId, message) => {
 			handleClientMessage(clientId, decrypted);
 		} else if (action === 'w') {
 			handleChannelMessage(clientId, decrypted);
+		} else if (action === 's') {
+			handleStoreHistory(clientId, decrypted);
+		} else if (action === 'h') {
+			handleHistoryRequest(clientId, decrypted);
 		}
 
 	} catch (error) {
@@ -319,6 +377,85 @@ const handleJoinChannel = (clientId, decrypted) => {
 
 	} catch (error) {
 		logEvent('message-join', [clientId, error], 'error');
+	}
+};
+
+const isHistoryEnvelope = (envelope) => {
+	return (
+		isObject(envelope) &&
+		envelope.v === 1 &&
+		isString(envelope.i) &&
+		envelope.i.length <= 128 &&
+		Number.isSafeInteger(envelope.ts) &&
+		envelope.ts > 0 &&
+		isString(envelope.n) &&
+		envelope.n.length <= 64 &&
+		isString(envelope.c)
+	)
+};
+
+const isHistoryAuthToken = (token) => isString(token) && token.length >= 32 && token.length <= 128;
+
+const historyTokenMatches = (channel, token, createIfMissing = false) => {
+	if (!isHistoryAuthToken(token)) return false;
+	if (createIfMissing) insertRoomStatement.run(channel, token, Date.now());
+	const room = selectRoomStatement.get(channel);
+	if (!room || !isString(room.auth_token)) return false;
+	const expected = Buffer.from(room.auth_token, 'utf8');
+	const actual = Buffer.from(token, 'utf8');
+	return expected.length === actual.length && crypto.timingSafeEqual(expected, actual)
+};
+
+const handleStoreHistory = (clientId, decrypted) => {
+	const client = clients[clientId];
+	if (!client || !client.channel || !isHistoryEnvelope(decrypted.p) ||
+		!historyTokenMatches(client.channel, decrypted.k, true)) return;
+	try {
+		const payload = JSON.stringify(decrypted.p);
+		if (Buffer.byteLength(payload, 'utf8') > config.historyMaxMessageBytes) return;
+		insertHistoryStatement.run(client.channel, decrypted.p.i, decrypted.p.ts, payload);
+		pruneHistoryStatement.run(client.channel, client.channel, config.historyLimitPerRoom)
+	} catch (error) {
+		logEvent('history-store', [clientId, error], 'error')
+	}
+};
+
+const handleHistoryRequest = (clientId, decrypted) => {
+	const client = clients[clientId];
+	if (!client || !client.channel || !isObject(decrypted.p)) return;
+	try {
+		if (!historyTokenMatches(client.channel, decrypted.k)) {
+			sendMessage(client.connection, encryptMessage({
+				a: 'h',
+				p: { m: [], b: null, x: false }
+			}, client.shared));
+			return
+		}
+		const before = Number.isSafeInteger(decrypted.p.b) && decrypted.p.b > 0 ?
+			decrypted.p.b : Number.MAX_SAFE_INTEGER;
+		const limit = Math.max(1, Math.min(Number(decrypted.p.l) || config.historyPageSize, 100));
+		const rows = selectHistoryStatement.all(client.channel, before, limit + 1);
+		const selected = [];
+		let responseBytes = 0;
+		for (const row of rows.slice(0, limit)) {
+			const rowBytes = Buffer.byteLength(row.payload, 'utf8');
+			if (selected.length > 0 && responseBytes + rowBytes > config.historyMaxResponseBytes) break;
+			selected.push({ id: Number(row.id), payload: JSON.parse(row.payload) });
+			responseBytes += rowBytes
+		}
+		const hasMore = rows.length > selected.length;
+		const nextBefore = selected.length > 0 ? selected[selected.length - 1].id : null;
+		const historyMessage = {
+			a: 'h',
+			p: {
+				m: selected.reverse().map((row) => ({ ...row.payload, s: row.id })),
+				b: nextBefore,
+				x: hasMore
+			}
+		};
+		sendMessage(client.connection, encryptMessage(historyMessage, client.shared))
+	} catch (error) {
+		logEvent('history-load', [clientId, error], 'error')
 	}
 };
 

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>NodeCrypt Desktop</title>
+	<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+	<header class="topbar">
+		<div class="brand">NodeCrypt Desktop</div>
+		<div class="status" id="status">正在发现节点</div>
+	</header>
+	<main>
+		<section class="node-toolbar">
+			<label for="node-name">本机名称</label>
+			<div class="name-control">
+				<input id="node-name" type="text" minlength="2" maxlength="32">
+				<button type="button" id="save-name">保存</button>
+			</div>
+			<button type="button" class="secondary" id="refresh">刷新</button>
+		</section>
+		<section class="network-access">
+			<div>
+				<div class="network-title">局域网访问</div>
+				<div class="network-detail" id="network-detail">正在检查网络状态</div>
+				<div class="firewall-rules">TCP 8788–8807 · UDP 42429 · 仅限本地子网</div>
+				<div class="firewall-program" id="firewall-program"></div>
+			</div>
+			<div class="network-actions">
+				<button type="button" class="secondary" id="configure-firewall">添加规则</button>
+				<button type="button" class="danger" id="remove-firewall">删除规则</button>
+			</div>
+		</section>
+		<section class="direct-connect">
+			<label for="direct-address">节点或房间地址</label>
+			<div class="address-control">
+				<input id="direct-address" type="text" inputmode="url" placeholder="192.168.1.20（默认 8788）或完整房间链接">
+				<button type="button" id="direct-connect">进入</button>
+			</div>
+			<div class="field-error" id="address-error" role="alert"></div>
+		</section>
+		<section class="recent-rooms" id="recent-rooms" hidden>
+			<div class="section-heading">
+				<div class="section-title">最近房间</div>
+			</div>
+			<div class="recent-room-list" id="recent-room-list"></div>
+		</section>
+		<section class="node-list" id="node-list" aria-live="polite"></section>
+	</main>
+	<script src="app.js"></script>
+</body>
+</html>

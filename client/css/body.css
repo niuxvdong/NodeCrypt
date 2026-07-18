@@ -251,6 +251,14 @@ body {
 	transform: translateY(1px);
 }
 
+.room-entry-error {
+	min-height: 20px;
+	color: #b42318;
+	font-size: 13px;
+	line-height: 1.45;
+	text-align: center;
+}
+
 .login-modal {
 	position: fixed;
 	z-index: 9999;

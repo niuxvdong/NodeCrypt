@@ -37,8 +37,10 @@ export function renderChatArea() {
 		return
 	}
 	chatArea.innerHTML = '';
-	roomsData[activeRoomIndex].messages.forEach(m => {
-		if (m.type === 'me') addMsg(m.text, true, m.msgType || 'text', m.timestamp);
+	const room = roomsData[activeRoomIndex];
+	const conversationId = room.activeConversationId || 'group';
+	room.messages.filter(message => (message.conversationId || 'group') === conversationId).forEach(m => {
+		if (m.type === 'me') addMsg(m.text, true, m.msgType || 'text', m.timestamp, m.messageId);
 		else if (m.type === 'system') addSystemMsg(m.text, true, m.timestamp);
 		else addOtherMsg(m.text, m.userName, m.avatar, true, m.msgType || 'text', m.timestamp)
 	})
@@ -46,16 +48,22 @@ export function renderChatArea() {
 
 // Add a message to the chat area
 // 添加消息到聊天区域
-export function addMsg(text, isHistory = false, msgType = 'text', timestamp = null) {
+export function addMsg(text, isHistory = false, msgType = 'text', timestamp = null, messageId = null) {
 	let ts = isHistory ? timestamp : (timestamp || Date.now());
 	if (!ts) return;
 	if (!isHistory && activeRoomIndex >= 0) {
+		const room = roomsData[activeRoomIndex];
 		roomsData[activeRoomIndex].messages.push({
 			type: 'me',
 			text,
 			msgType,
-			timestamp: ts
-		})
+			timestamp: ts,
+			messageId,
+			conversationId: msgType.includes('_private') ? room.activeConversationId : 'group'
+		});
+		if (messageId && roomsData[activeRoomIndex].historyMessageIds) {
+			roomsData[activeRoomIndex].historyMessageIds.add(messageId)
+		}
 	}	const chatArea = $id('chat-area');
 	if (!chatArea) return;
 	let className = 'bubble me' + (msgType.includes('_private') ? ' private-message' : '');
@@ -209,10 +217,12 @@ export function addOtherMsg(msg, userName = '', avatar = '', isHistory = false, 
 export function addSystemMsg(text, isHistory = false, timestamp = null) {
 	if (!isHistory && activeRoomIndex >= 0) {
 		const ts = timestamp || Date.now();
+		const room = roomsData[activeRoomIndex];
 		roomsData[activeRoomIndex].messages.push({
 			type: 'system',
 			text,
-			timestamp: ts
+			timestamp: ts,
+			conversationId: room.activeConversationId || 'group'
 		})
 	}
 	const chatArea = $id('chat-area');
@@ -232,10 +242,10 @@ export function updateChatInputStyle() {
 	const chatInputArea = $('.chat-input-area');
 	const placeholder = $('.input-field-placeholder');
 	const inputMessageInput = $('.input-message-input');
-	if (!chatInputArea || !placeholder || !inputMessageInput) return;	if (rd && rd.privateChatTargetId) {
+	if (!chatInputArea || !placeholder || !inputMessageInput) return;	if (rd && rd.activeConversationId !== 'group') {
 		addClass(chatInputArea, 'private-mode');
 		addClass(inputMessageInput, 'private-mode');
-		placeholder.textContent = `${t('ui.private_message_to', 'Private Message to')} ${escapeHTML(rd.privateChatTargetName)}`
+		placeholder.textContent = `${t('ui.private_message_to', 'Private Message to')} ${rd.privateChatTargetName}${rd.privateChatTargetId ? '' : ` (${t('ui.offline', 'Offline')})`}`
 	} else {
 		removeClass(chatInputArea, 'private-mode');
 		removeClass(inputMessageInput, 'private-mode');
@@ -381,7 +391,7 @@ function renderFileMessage(fileData, isSender) {
 			showProgress = true;
 		} else if (transfer.status === 'completed') {
 			// 完成时不显示任何状态，只显示下载按钮
-			downloadBtnStyle = isSender ? 'display: none;' : 'display: flex;';
+			downloadBtnStyle = isSender && !transfer.fromHistory ? 'display: none;' : 'display: flex;';
 		}	} else if (isSender) {
 		// 发送方历史消息，不显示状态和下载按钮
 		downloadBtnStyle = 'display: none;';

@@ -14,6 +14,9 @@ import chacha from 'js-chacha20';
 import {
 	Buffer
 } from 'buffer';
+import { gcm } from '@noble/ciphers/aes.js';
+import { pbkdf2Async } from '@noble/hashes/pbkdf2.js';
+import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 window.Buffer = Buffer;
 
 // Main NodeCrypt class for secure communication
@@ -35,15 +38,21 @@ class NodeCrypt {
 			onClientSecured: callbacks.onClientSecured || null,
 			onClientList: callbacks.onClientList || null,
 			onClientMessage: callbacks.onClientMessage || null,
+			onHistoryMessages: callbacks.onHistoryMessages || null,
+			onJoinRejected: callbacks.onJoinRejected || null,
 		};
 		this.SERVER_KEY_STORAGE = 'nodecrypt_server_key';
 		try {
-			this.clientEc = new elliptic('curve25519')
+			this.clientEc = new elliptic('curve25519');
+			this.serverEc = new elliptic('p384')
 		} catch (error) {
 			this.logEvent('constructor', error, 'error')
 		}
 		this.serverKeys = null;
 		this.serverShared = null;
+		this.historyKeyPromise = null;
+		this.historyAuthTokenPromise = null;
+		this.joinConfirmed = false;
 		this.credentials = null;
 		this.connection = null;
 		this.reconnect = null;
@@ -77,11 +86,17 @@ class NodeCrypt {
 	setCredentials(username, channel, password) {
 		this.logEvent('setCredentials');
 		try {
+			const channelHash = sha256(channel);
 			this.credentials = {
 				username: username,
-				channel: sha256(channel),
-				password: sha256(password)
-			}
+				channel: channelHash,
+				password: sha256(password),
+				roomScope: sha256(`nodecrypt-room-scope|${sha256(password)}`),
+				userClaim: sha256(`nodecrypt-user|${channelHash}|${sha256(password)}|${username.trim().toLowerCase()}`)
+			};
+			const historySecrets = this.deriveHistorySecrets(password, channelHash);
+			this.historyKeyPromise = historySecrets.then((secrets) => secrets.key);
+			this.historyAuthTokenPromise = historySecrets.then((secrets) => secrets.authToken)
 		} catch (error) {
 			this.logEvent('setCredentials', error, 'error');
 			return (false)
@@ -101,6 +116,7 @@ class NodeCrypt {
 		this.serverKeys = null;
 		this.serverShared = null;
 		this.channel = {};
+		this.joinConfirmed = false;
 		try {
 			this.connection = new WebSocket(this.config.wsAddress);
 			this.connection.onopen = this.onOpen;
@@ -134,9 +150,15 @@ class NodeCrypt {
 		this.callbacks.onClientSecured = null;
 		this.callbacks.onClientList = null;
 		this.callbacks.onClientMessage = null;
+		this.callbacks.onHistoryMessages = null;
+		this.callbacks.onJoinRejected = null;
 		this.clientEc = null;
+		this.serverEc = null;
 		this.serverKeys = null;
 		this.serverShared = null;
+		this.historyKeyPromise = null;
+		this.historyAuthTokenPromise = null;
+		this.joinConfirmed = false;
 		this.credentials = null;
 		this.connection.onopen = null;
 		this.connection.onmessage = null;
@@ -159,19 +181,58 @@ class NodeCrypt {
 
 	// WebSocket open event handler
 	// WebSocket 连接打开事件处理
+	canUseSubtleCrypto() {
+		return window.isSecureContext !== false && Boolean(crypto.subtle)
+	}
+
 	async onOpen() {
 		this.logEvent('onOpen');
 		this.startPing();
 		try {
-			this.serverKeys = await crypto.subtle.generateKey({
-				name: 'ECDH',
-				namedCurve: 'P-384'
-			}, false, ['deriveKey', 'deriveBits']);
+			if (this.canUseSubtleCrypto()) {
+				this.serverKeys = await crypto.subtle.generateKey({
+					name: 'ECDH',
+					namedCurve: 'P-384'
+				}, false, ['deriveKey', 'deriveBits'])
+			} else {
+				this.serverKeys = {
+					fallback: true,
+					keys: this.serverEc.genKeyPair()
+				}
+			}
 			this.serverShared = null;
-			this.sendMessage(Buffer.from(await crypto.subtle.exportKey('raw', this.serverKeys.publicKey)).toString('hex'))
+			const publicKey = this.serverKeys.fallback ?
+				this.serverKeys.keys.getPublic().encode('hex', false) :
+				Buffer.from(await crypto.subtle.exportKey('raw', this.serverKeys.publicKey)).toString('hex');
+			this.sendMessage(publicKey)
 		} catch (error) {
 			this.logEvent('onOpen', error, 'error')
 		}
+	}
+
+	async establishServerShared(publicKeyHex, signature) {
+		if (this.serverKeys && this.serverKeys.fallback) {
+			const publicKey = this.serverEc.keyFromPublic(publicKeyHex, 'hex').getPublic();
+			this.serverShared = this.serverKeys.keys.derive(publicKey).toArrayLike(Buffer, 'be', 48).slice(8, 40);
+			return true
+		}
+		if (!this.canUseSubtleCrypto()) return false;
+		const verified = await crypto.subtle.verify({
+			name: 'RSASSA-PKCS1-v1_5'
+		}, await crypto.subtle.importKey('spki', Buffer.from(this.config.rsaPublic, 'base64'), {
+			name: 'RSASSA-PKCS1-v1_5',
+			hash: { name: 'SHA-256' }
+		}, false, ['verify']), Buffer.from(signature, 'base64'), Buffer.from(publicKeyHex, 'hex'));
+		if (!verified) return false;
+		this.serverShared = Buffer.from(await crypto.subtle.deriveBits({
+			name: 'ECDH',
+			namedCurve: 'P-384',
+			public: await crypto.subtle.importKey('raw', Buffer.from(publicKeyHex, 'hex'), {
+				name: 'ECDH',
+				namedCurve: 'P-384'
+			}, true, [])
+		}, this.serverKeys.privateKey, 384)).slice(8, 40);
+		return true
 	}
 
 	// WebSocket message event handler
@@ -199,33 +260,13 @@ class NodeCrypt {
 				return
 			}
 			try {
-				if (await crypto.subtle.verify({
-						name: 'RSASSA-PKCS1-v1_5'
-					}, await crypto.subtle.importKey('spki', Buffer.from(this.config.rsaPublic, 'base64'), {
-						name: 'RSASSA-PKCS1-v1_5',
-						hash: {
-							name: 'SHA-256'
-						}
-					}, false, ['verify']), Buffer.from(parts[1], 'base64'), Buffer.from(parts[0], 'hex')) === true) {
-					this.serverShared = Buffer.from(await crypto.subtle.deriveBits({
-						name: 'ECDH',
-						namedCurve: 'P-384',
-						public: await crypto.subtle.importKey('raw', Buffer.from(parts[0], 'hex'), {
-							name: 'ECDH',
-							namedCurve: 'P-384'
-						}, true, [])
-					}, this.serverKeys.privateKey, 384)).slice(8, 40);
+				if (await this.establishServerShared(parts[0], parts[1])) {
 					this.sendMessage(this.encryptServerMessage({
 						a: 'j',
-						p: this.credentials.channel
+						p: this.credentials.channel,
+						g: this.credentials.roomScope,
+						u: this.credentials.userClaim
 					}, this.serverShared));
-					if (this.callbacks.onServerSecured) {
-						try {
-							this.callbacks.onServerSecured()
-						} catch (error) {
-							this.logEvent('onMessage-server-secured-callback', error, 'error')
-						}
-					}
 				}
 			} catch (error) {
 				this.logEvent('onMessage', error, 'error')
@@ -237,7 +278,27 @@ class NodeCrypt {
 		if (!this.isObject(serverDecrypted) || !this.isString(serverDecrypted.a)) {
 			return
 		}
+		if (serverDecrypted.a === 'j' && this.isObject(serverDecrypted.p)) {
+			if (serverDecrypted.p.o === true) {
+				this.confirmJoin()
+			} else if (serverDecrypted.p.o === false) {
+				const reason = this.isString(serverDecrypted.p.r) ? serverDecrypted.p.r : 'join_rejected';
+				if (this.callbacks.onJoinRejected) {
+					try {
+						this.callbacks.onJoinRejected(reason)
+					} catch (error) {
+						this.logEvent('onMessage-join-rejected-callback', error, 'error')
+					}
+				}
+				this.credentials = null;
+				this.stopReconnect();
+				this.disconnect()
+			}
+			return
+		}
 		if (serverDecrypted.a === 'l' && this.isArray(serverDecrypted.p)) {
+			// Compatibility fallback for servers released before join acknowledgements.
+			this.confirmJoin();
 			try {
 				for (const clientId in this.channel) {
 					if (serverDecrypted.p.indexOf(clientId) < 0) {
@@ -267,12 +328,11 @@ class NodeCrypt {
 			if (this.callbacks.onClientList) {
 				let clients = [];
 				for (const clientId in this.channel) {
-					if (this.channel[clientId].shared && this.channel[clientId].username) {
-						clients.push({
-							clientId: clientId,
-							username: this.channel[clientId].username
-						})
-					}
+					clients.push({
+						clientId,
+						username: this.channel[clientId].username || '',
+						pending: !this.channel[clientId].shared || !this.channel[clientId].username
+					})
 				}
 				try {
 					this.callbacks.onClientList(clients)
@@ -280,6 +340,10 @@ class NodeCrypt {
 					this.logEvent('onMessage-client-list-callback', error, 'error')
 				}
 			}
+			return
+		}
+		if (serverDecrypted.a === 'h' && this.isObject(serverDecrypted.p) && this.isArray(serverDecrypted.p.m)) {
+			await this.handleHistoryPage(serverDecrypted.p, 'server');
 			return
 		}
 		if (!this.isString(serverDecrypted.p) || !this.isString(serverDecrypted.c)) {
@@ -336,19 +400,43 @@ class NodeCrypt {
 				return
 			}
 			if (clientDecrypted.a === 'm' && this.isString(clientDecrypted.t) && (this.isString(clientDecrypted.d) || this.isObject(clientDecrypted.d))) {
+				const senderName = this.channel[serverDecrypted.c].username;
+				const messageId = this.isString(clientDecrypted.i) ? clientDecrypted.i : null;
+				const timestamp = Number.isFinite(clientDecrypted.ts) ? clientDecrypted.ts : null;
+				const persistentGroupTypes = ['text', 'image', 'file_start', 'file_volume', 'file_complete'];
+				if (messageId && timestamp && persistentGroupTypes.includes(clientDecrypted.t)) {
+					this.storeLocalPlainHistory(senderName, clientDecrypted.t, clientDecrypted.d, {
+						messageId,
+						timestamp
+					}).catch((error) => this.logEvent('storeIncomingLocalHistory', error, 'error'))
+				}
 				if (this.callbacks.onClientMessage) {
 					try {
 						this.callbacks.onClientMessage({
 							clientId: serverDecrypted.c,
-							username: this.channel[serverDecrypted.c].username,
+							username: senderName,
 							type: clientDecrypted.t,
-							data: clientDecrypted.d
+							data: clientDecrypted.d,
+							messageId,
+							timestamp
 						})
 					} catch (error) {
 						this.logEvent('onMessage-client-message-callback', error, 'error')
 					}
 				}
 				return
+			}
+		}
+	}
+
+	confirmJoin() {
+		if (this.joinConfirmed) return;
+		this.joinConfirmed = true;
+		if (this.callbacks.onServerSecured) {
+			try {
+				this.callbacks.onServerSecured()
+			} catch (error) {
+				this.logEvent('confirmJoin', error, 'error')
 			}
 		}
 	}
@@ -481,17 +569,20 @@ class NodeCrypt {
 
 	// Send a message to all channels
 	// 向所有频道发送消息
-	sendChannelMessage(type, data) {
+	sendChannelMessage(type, data, metadata = {}) {
 		if (this.serverShared) {
 			try {
 				let payloads = {};
 				for (const clientId in this.channel) {
 					if (this.channel[clientId].shared && this.channel[clientId].username) {
-						payloads[clientId] = this.encryptClientMessage({
+						const message = {
 							a: 'm',
 							t: type,
 							d: data
-						}, this.channel[clientId].shared);
+						};
+						if (metadata.messageId) message.i = metadata.messageId;
+						if (metadata.timestamp) message.ts = metadata.timestamp;
+						payloads[clientId] = this.encryptClientMessage(message, this.channel[clientId].shared);
 						if (payloads[clientId].length === 0) {
 							return (false)
 						}
@@ -513,6 +604,209 @@ class NodeCrypt {
 			}
 		}
 		return (false)
+	}
+
+	// Send a group message in real time and persist an independently encrypted history copy.
+	sendPersistentChannelMessage(type, data) {
+		const metadata = {
+			messageId: this.generateMessageId(),
+			timestamp: Date.now()
+		};
+		const sent = this.sendChannelMessage(type, data, metadata);
+		if (sent) {
+			this.storeHistoryMessage(type, data, metadata).catch((error) => {
+				this.logEvent('storeHistoryMessage', error, 'error')
+			})
+		}
+		return {
+			...metadata,
+			sent
+		}
+	}
+
+	async deriveHistorySecrets(password, channel) {
+		const salt = Buffer.from(sha256(`nodecrypt-history:${channel}`), 'hex');
+		const derived = await pbkdf2Async(nobleSha256, Buffer.from(password, 'utf8'), salt, {
+			c: 210000,
+			dkLen: 64
+		});
+		return {
+			key: derived.slice(0, 32),
+			authToken: Buffer.from(derived.slice(32)).toString('base64')
+		}
+	}
+
+	getHistoryAdditionalData(messageId, timestamp) {
+		return Buffer.from(`nodecrypt-history|1|${this.credentials.channel}|${messageId}|${timestamp}`, 'utf8')
+	}
+
+	generateMessageId() {
+		if (crypto.randomUUID) return crypto.randomUUID();
+		return Buffer.from(crypto.getRandomValues(new Uint8Array(16))).toString('hex')
+	}
+
+	async encryptHistoryMessage(type, data, metadata, username = this.credentials.username) {
+		const key = await this.historyKeyPromise;
+		const nonce = crypto.getRandomValues(new Uint8Array(12));
+		const plaintext = Buffer.from(JSON.stringify({
+			i: metadata.messageId,
+			ts: metadata.timestamp,
+			u: username,
+			t: type,
+			d: data
+		}), 'utf8');
+		const ciphertext = gcm(
+			key,
+			nonce,
+			this.getHistoryAdditionalData(metadata.messageId, metadata.timestamp)
+		).encrypt(plaintext);
+		return {
+			v: 1,
+			i: metadata.messageId,
+			ts: metadata.timestamp,
+			n: Buffer.from(nonce).toString('base64'),
+			c: Buffer.from(ciphertext).toString('base64')
+		}
+	}
+
+	async decryptHistoryMessage(envelope) {
+		if (!this.isObject(envelope) || envelope.v !== 1 || !this.isString(envelope.i) ||
+			!Number.isFinite(envelope.ts) || !this.isString(envelope.n) || !this.isString(envelope.c)) {
+			return null
+		}
+		try {
+			const key = await this.historyKeyPromise;
+			const plaintext = gcm(
+				key,
+				Buffer.from(envelope.n, 'base64'),
+				this.getHistoryAdditionalData(envelope.i, envelope.ts)
+			).decrypt(Buffer.from(envelope.c, 'base64'));
+			const message = JSON.parse(Buffer.from(plaintext).toString('utf8'));
+			if (message.i !== envelope.i || message.ts !== envelope.ts || !this.isString(message.u) ||
+				!this.isString(message.t) || (!this.isString(message.d) && !this.isObject(message.d))) {
+				return null
+			}
+			return {
+				messageId: message.i,
+				timestamp: message.ts,
+				userName: message.u,
+				type: message.t,
+				data: message.d
+			}
+		} catch (error) {
+			this.logEvent('decryptHistoryMessage', error, 'error');
+			return null
+		}
+	}
+
+	async storeHistoryMessage(type, data, metadata) {
+		if (!this.serverShared || !this.isOpen()) return false;
+		const [envelope, authToken] = await Promise.all([
+			this.encryptHistoryMessage(type, data, metadata),
+			this.historyAuthTokenPromise
+		]);
+		const payload = this.encryptServerMessage({
+			a: 's',
+			p: envelope,
+			k: authToken
+		}, this.serverShared);
+		const remoteStored = Boolean(payload && payload.length <= (8 * 1024 * 1024) && this.sendMessage(payload));
+		const localStored = await this.storeLocalHistoryEnvelope(envelope, authToken);
+		return remoteStored || localStored
+	}
+
+	getLocalHistoryAPI() {
+		const app = window.go && window.go.main && window.go.main.App;
+		if (!app || typeof app.LoadLocalHistory !== 'function' || typeof app.StoreLocalHistory !== 'function') return null;
+		return app
+	}
+
+	async storeLocalHistoryEnvelope(envelope, authToken) {
+		const app = this.getLocalHistoryAPI();
+		if (!app) return false;
+		try {
+			return await app.StoreLocalHistory(
+				this.credentials.channel,
+				authToken,
+				envelope.v,
+				envelope.i,
+				envelope.ts,
+				envelope.n,
+				envelope.c
+			)
+		} catch (error) {
+			this.logEvent('storeLocalHistoryEnvelope', error, 'error');
+			return false
+		}
+	}
+
+	async storeLocalPlainHistory(username, type, data, metadata) {
+		const [envelope, authToken] = await Promise.all([
+			this.encryptHistoryMessage(type, data, metadata, username),
+			this.historyAuthTokenPromise
+		]);
+		return this.storeLocalHistoryEnvelope(envelope, authToken)
+	}
+
+	async requestLocalHistory(before = null, limit = 50) {
+		const app = this.getLocalHistoryAPI();
+		if (!app) return false;
+		try {
+			const authToken = await this.historyAuthTokenPromise;
+			const page = await app.LoadLocalHistory(
+				this.credentials.channel,
+				authToken,
+				Number.isFinite(before) ? before : 0,
+				Math.max(1, Math.min(Number(limit) || 50, 100))
+			);
+			if (!this.isObject(page) || !this.isArray(page.m)) return false;
+			await this.handleHistoryPage(page, 'local');
+			return true
+		} catch (error) {
+			this.logEvent('requestLocalHistory', error, 'error');
+			return false
+		}
+	}
+
+	async requestHistory(before = null, limit = 50) {
+		if (!this.serverShared || !this.isOpen()) return false;
+		const authToken = await this.historyAuthTokenPromise;
+		if (!this.serverShared || !this.isOpen()) return false;
+		const explicitSources = this.isObject(before);
+		const cursors = explicitSources ? before : { server: before, local: before };
+		const payload = this.encryptServerMessage({
+			a: 'h',
+			k: authToken,
+			p: {
+				b: Number.isFinite(cursors.server) ? cursors.server : null,
+				l: Math.max(1, Math.min(Number(limit) || 50, 100))
+			}
+		}, this.serverShared);
+		const requestServer = !explicitSources || Object.prototype.hasOwnProperty.call(cursors, 'server');
+		const requestLocal = !explicitSources || Object.prototype.hasOwnProperty.call(cursors, 'local');
+		const serverRequested = requestServer ? this.sendMessage(payload) : false;
+		const localRequested = requestLocal ? await this.requestLocalHistory(cursors.local, limit) : false;
+		return serverRequested || localRequested
+	}
+
+	async handleHistoryPage(page, source = 'server') {
+		const decrypted = await Promise.all(page.m.map((envelope) => this.decryptHistoryMessage(envelope)));
+		const messages = decrypted.filter(Boolean);
+		if (this.callbacks.onHistoryMessages) {
+			try {
+				this.callbacks.onHistoryMessages({
+					messages,
+					before: Number.isFinite(page.b) ? page.b : null,
+					hasMore: page.x === true,
+					status: this.isString(page.r) ? page.r : 'ok',
+					source,
+					encryptedCount: page.m.length,
+					decryptFailed: decrypted.length - messages.length
+				})
+			} catch (error) {
+				this.logEvent('onHistoryMessages-callback', error, 'error')
+			}
+		}
 	}
 
 	// Encrypt a message for the server

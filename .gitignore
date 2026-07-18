@@ -19,6 +19,8 @@ Thumbs.db
 # Build output
 dist/
 build/
+/release/
+/NodeCrypt-Data/
 
 # Vite
 .vite/
@@ -40,6 +42,11 @@ build/
 # Ignore by folder
 /node_modules/
 /server/node_modules/
+/server/data/
+/desktop/build/bin/
+/desktop/frontend/wailsjs/
+/desktop/nodeassets/*
+!/desktop/nodeassets/.gitkeep
 
 
 # Ignore output in client (if any)

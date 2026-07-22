@@ -166,18 +166,30 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 	if (sidebarUsername) sidebarUsername.textContent = userName;
 	setSidebarAvatar(userName);
 	let closed = false;
+	let chatInst = null;
+	const discardPendingRoom = () => {
+		const currentIndex = roomsData.indexOf(newRd);
+		if (currentIndex >= 0) roomsData.splice(currentIndex, 1);
+		activeRoomIndex = roomsData.length ? Math.min(Math.max(currentIndex, 0), roomsData.length - 1) : -1;
+		if (activeRoomIndex >= 0) switchRoom(activeRoomIndex);
+		else renderRooms(-1)
+	};
 	const callbacks = {
 		onServerClosed: () => {
 			setStatus('Node connection closed');
 			if (onResult && !closed) {
 				closed = true;
-			onResult(false)
+				discardPendingRoom();
+				if (chatInst) {
+					chatInst.credentials = null;
+					chatInst.stopReconnect();
+					setTimeout(() => chatInst.destruct(), 0)
+				}
+				onResult(false, 'node_unreachable')
 			}
 		},
 		onJoinRejected: (reason) => {
-			roomsData.splice(idx, 1);
-			activeRoomIndex = roomsData.length ? Math.min(idx, roomsData.length - 1) : -1;
-			renderRooms(activeRoomIndex);
+			discardPendingRoom();
 			if (onResult && !closed) {
 				closed = true;
 				onResult(false, reason)
@@ -214,7 +226,7 @@ export function joinRoom(userName, roomName, password, modal = null, onResult) {
 		onClientMessage: (msg) => handleClientMessage(idx, msg),
 		onHistoryMessages: (page) => handleHistoryMessages(idx, page)
 	};
-	const chatInst = new window.NodeCrypt(window.config, callbacks);
+	chatInst = new window.NodeCrypt(window.config, callbacks);
 	chatInst.setCredentials(userName, roomName, password);
 	chatInst.connect();
 	roomsData[idx].chat = chatInst

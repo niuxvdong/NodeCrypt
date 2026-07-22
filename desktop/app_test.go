@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestNormaliseNodeAddress(t *testing.T) {
 	tests := []struct {
@@ -25,6 +30,43 @@ func TestNormaliseNodeAddress(t *testing.T) {
 				t.Fatalf("normaliseNodeAddress(%q) = %q, %v; want %q, %v", test.input, actual, valid, test.expected, test.valid)
 			}
 		})
+	}
+}
+
+func TestUsableLocalIPv4RejectsAutomaticPrivateAddress(t *testing.T) {
+	if isUsableLocalIPv4(net.ParseIP("169.254.20.4")) {
+		t.Fatal("link-local address must not be advertised as a LAN endpoint")
+	}
+	if !isUsableLocalIPv4(net.ParseIP("192.168.3.115")) {
+		t.Fatal("private LAN address should be advertised")
+	}
+}
+
+func TestFindReachableNodeURLTriesAllCandidates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/runtime" {
+			http.NotFound(response, request)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		_, _ = response.Write([]byte(`{"mode":"desktop","authRequired":false}`))
+	}))
+	defer server.Close()
+
+	actual, ok := findReachableNodeURL([]string{"http://127.0.0.1:1", server.URL})
+	if !ok || actual != server.URL {
+		t.Fatalf("reachable candidate was not selected: %q, %v", actual, ok)
+	}
+}
+
+func TestProbeNodeEndpointRejectsUnrelatedHTTPServer(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		_, _ = response.Write([]byte(`{"mode":"other"}`))
+	}))
+	defer server.Close()
+
+	if probeNodeEndpoint(t.Context(), server.URL) {
+		t.Fatal("unrelated HTTP server must not be accepted as a NodeCrypt node")
 	}
 }
 

@@ -4,13 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	discoveryMagic = "nodecrypt-desktop-v1"
-	discoveryGroup = "239.255.42.99:42429"
+	discoveryMagic   = "nodecrypt-desktop-v1"
+	discoveryGroup   = "239.255.42.99:42429"
+	discoveryNodeTTL = 7 * time.Second
 )
 
 type NodeInfo struct {
@@ -32,8 +34,9 @@ type discoveryPacket struct {
 }
 
 type discoveredNode struct {
-	info NodeInfo
-	seen time.Time
+	info    NodeInfo
+	seen    time.Time
+	udpSeen time.Time
 }
 
 type DiscoveryService struct {
@@ -76,13 +79,75 @@ func StartDiscovery(id, name string, port int) *DiscoveryService {
 }
 
 func (d *DiscoveryService) acceptSystemNode(info NodeInfo) {
-	if info.ID == "" || info.ID == d.id || info.Address == "" || info.Port < 1 {
+	d.rememberNode(info, false)
+}
+
+func (d *DiscoveryService) rememberNode(info NodeInfo, fromUDP bool) {
+	if info.ID == "" || info.ID == d.id || info.Port < 1 {
 		return
 	}
-	info.LastSeen = time.Now().UnixMilli()
+	incomingAddresses := usableNodeAddresses(info)
+	if len(incomingAddresses) == 0 {
+		return
+	}
+	now := time.Now()
 	d.mu.Lock()
-	d.nodes[info.ID] = discoveredNode{info: info, seen: time.Now()}
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+	existing, found := d.nodes[info.ID]
+	preferIncoming := fromUDP || !found || existing.udpSeen.IsZero() || now.Sub(existing.udpSeen) > discoveryNodeTTL
+	merged := existing.info
+	orderedAddresses := append([]string(nil), existing.info.Addresses...)
+	if preferIncoming {
+		merged = info
+		orderedAddresses = append([]string(nil), incomingAddresses...)
+		orderedAddresses = append(orderedAddresses, existing.info.Addresses...)
+	} else {
+		orderedAddresses = append(orderedAddresses, incomingAddresses...)
+		if info.Name != "" {
+			merged.Name = info.Name
+		}
+		merged.Port = info.Port
+	}
+	if merged.Name == "" {
+		merged.Name = existing.info.Name
+	}
+	merged.ID = info.ID
+	merged.Addresses = uniqueIPv4Addresses(orderedAddresses)
+	if len(merged.Addresses) == 0 {
+		return
+	}
+	merged.Address = merged.Addresses[0]
+	merged.URL = fmt.Sprintf("http://%s:%d", merged.Address, merged.Port)
+	merged.LastSeen = now.UnixMilli()
+	record := discoveredNode{info: merged, seen: now, udpSeen: existing.udpSeen}
+	if fromUDP {
+		record.udpSeen = now
+	}
+	d.nodes[info.ID] = record
+}
+
+func usableNodeAddresses(info NodeInfo) []string {
+	candidates := make([]string, 0, len(info.Addresses)+1)
+	candidates = append(candidates, info.Address)
+	candidates = append(candidates, info.Addresses...)
+	return uniqueIPv4Addresses(candidates)
+}
+
+func uniqueIPv4Addresses(candidates []string) []string {
+	seen := make(map[string]bool)
+	addresses := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		ip := net.ParseIP(strings.TrimSpace(candidate))
+		if ip == nil || ip.To4() == nil || ip.IsUnspecified() || ip.IsMulticast() || ip.IsLoopback() {
+			continue
+		}
+		address := ip.To4().String()
+		if !seen[address] {
+			seen[address] = true
+			addresses = append(addresses, address)
+		}
+	}
+	return addresses
 }
 
 func (d *DiscoveryService) announceLoop() {
@@ -126,9 +191,7 @@ func (d *DiscoveryService) readLoop() {
 			Port:      packet.Port,
 			LastSeen:  time.Now().UnixMilli(),
 		}
-		d.mu.Lock()
-		d.nodes[packet.ID] = discoveredNode{info: info, seen: time.Now()}
-		d.mu.Unlock()
+		d.rememberNode(info, true)
 	}
 }
 
@@ -173,7 +236,7 @@ func (d *DiscoveryService) Nodes() []NodeInfo {
 func (d *DiscoveryService) prune() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	threshold := time.Now().Add(-7 * time.Second)
+	threshold := time.Now().Add(-discoveryNodeTTL)
 	for id, node := range d.nodes {
 		if node.seen.Before(threshold) {
 			delete(d.nodes, id)

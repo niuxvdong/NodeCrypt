@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io/fs"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -26,6 +27,30 @@ import (
 type protocolClient struct {
 	connection *websocket.Conn
 	shared     []byte
+}
+
+func TestDesktopServerAcceptsRemoteWailsClient(t *testing.T) {
+	server := startTestServer(t, filepath.Join(t.TempDir(), "remote.sqlite"))
+	defer server.Close()
+
+	address, ok := server.listener.Addr().(*net.TCPAddr)
+	if !ok || !address.IP.IsUnspecified() {
+		t.Fatalf("desktop server is not listening on all IPv4 interfaces: %v", server.listener.Addr())
+	}
+	headers := http.Header{}
+	headers.Set("Origin", "http://wails.localhost")
+	connection, response, err := websocket.DefaultDialer.Dial("ws://127.0.0.1:"+serverPort(server), headers)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("remote Wails origin returned %s: %v", response.Status, err)
+		}
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_, message, err := connection.ReadMessage()
+	if err != nil || !strings.Contains(string(message), `"type":"server-key"`) {
+		t.Fatalf("desktop handshake did not start: %s, %v", message, err)
+	}
 }
 
 func TestChatServerRelayAndHistoryWithoutAccount(t *testing.T) {

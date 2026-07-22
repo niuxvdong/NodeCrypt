@@ -470,7 +470,9 @@ export function loginFormHandler(modal) {
 				error.className = 'room-entry-error';
 				error.textContent = reason === 'username_taken' ?
 					t('ui.username_taken', 'This username is already in use in the room') :
-					t('ui.join_rejected', 'Unable to enter the room');
+					reason === 'node_unreachable' ?
+						t('ui.node_unreachable', 'Unable to connect to the selected node. Check its IP, firewall, and port.') :
+						t('ui.join_rejected', 'Unable to enter the room');
 				formElement.appendChild(error)
 			}
 		})

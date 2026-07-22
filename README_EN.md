@@ -15,6 +15,8 @@ Every app embeds the HTTP/WebSocket chat node and SQLite. Group text, images, an
 
 The discovery view keeps up to 12 recent rooms for quick re-entry. Room passwords are protected with Windows DPAPI for the current Windows user and are never stored as plaintext in `desktop.json`.
 
+Closing the window asks whether to exit or keep NodeCrypt running in the Windows system tray. Background mode keeps node discovery, chat relay, and SQLite history available. Use `Open NodeCrypt` from the tray, or launch the EXE again, to restore the window. The tray also provides `Exit` for a complete shutdown.
+
 A browser connecting by LAN IP does not need its own SQLite database. It requests client-encrypted history from the selected EXE node and decrypts it in the browser with the room password. The EXE merges node history with its own local SQLite copy. A new computer starts with an empty local database but can still load history held by the online node. Browser users lose access to that node's history while it is offline; EXE users retain messages previously synchronized locally.
 
 This remains a shared blind-relay design rather than serverless P2P: users discover each other automatically, but they must connect to the same online node for real-time chat. Each computer can still read its own local history while that node is offline. Back up the complete `%APPDATA%\NodeCrypt Desktop` directory when moving local data.

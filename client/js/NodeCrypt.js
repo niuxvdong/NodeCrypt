@@ -30,6 +30,7 @@ class NodeCrypt {
 			wsAddress: config.wsAddress || '',
 			reconnectDelay: config.reconnectDelay || 3000,
 			pingInterval: config.pingInterval || 20000,
+			connectionTimeout: config.connectionTimeout || 10000,
 			debug: config.debug || false,
 		};
 		this.callbacks = {
@@ -53,8 +54,10 @@ class NodeCrypt {
 		this.historyKeyPromise = null;
 		this.historyAuthTokenPromise = null;
 		this.joinConfirmed = false;
+		this.hasJoined = false;
 		this.credentials = null;
 		this.connection = null;
+		this.connectTimer = null;
 		this.reconnect = null;
 		this.ping = null;
 		this.channel = {};
@@ -113,6 +116,7 @@ class NodeCrypt {
 		this.logEvent('connect', this.config.wsAddress);
 		this.stopReconnect();
 		this.stopPing();
+		this.stopConnectTimer();
 		this.serverKeys = null;
 		this.serverShared = null;
 		this.channel = {};
@@ -122,7 +126,17 @@ class NodeCrypt {
 			this.connection.onopen = this.onOpen;
 			this.connection.onmessage = this.onMessage;
 			this.connection.onerror = this.onError;
-			this.connection.onclose = this.onClose
+			this.connection.onclose = this.onClose;
+			this.connectTimer = setTimeout(() => {
+				if (this.joinConfirmed || !this.connection) return;
+				if (!this.hasJoined) this.credentials = null;
+				try {
+					this.connection.close()
+				} catch (error) {
+					this.logEvent('connect-timeout', error, 'error');
+					if (this.callbacks.onServerClosed) this.callbacks.onServerClosed()
+				}
+			}, this.config.connectionTimeout)
 		} catch (error) {
 			this.logEvent('connect', error, 'error');
 			return (false)
@@ -136,6 +150,7 @@ class NodeCrypt {
 		this.logEvent('destruct');
 		this.stopReconnect();
 		this.stopPing();
+		this.stopConnectTimer();
 		this.reconnect = null;
 		this.ping = null;
 		this.config = {
@@ -159,6 +174,7 @@ class NodeCrypt {
 		this.historyKeyPromise = null;
 		this.historyAuthTokenPromise = null;
 		this.joinConfirmed = false;
+		this.hasJoined = false;
 		this.credentials = null;
 		this.connection.onopen = null;
 		this.connection.onmessage = null;
@@ -432,6 +448,8 @@ class NodeCrypt {
 	confirmJoin() {
 		if (this.joinConfirmed) return;
 		this.joinConfirmed = true;
+		this.hasJoined = true;
+		this.stopConnectTimer();
 		if (this.callbacks.onServerSecured) {
 			try {
 				this.callbacks.onServerSecured()
@@ -445,6 +463,7 @@ class NodeCrypt {
 	// WebSocket 错误事件处理
 	async onError(event) {
 		this.logEvent('onError', event, 'error');
+		this.stopConnectTimer();
 		this.disconnect();
 		if (this.credentials) {
 			this.startReconnect()
@@ -462,6 +481,7 @@ class NodeCrypt {
 	// WebSocket 关闭事件处理
 	async onClose(event) {
 		this.logEvent('onClose', event);
+		this.stopConnectTimer();
 		this.disconnect();
 		if (this.credentials) {
 			this.startReconnect()
@@ -494,7 +514,14 @@ class NodeCrypt {
 	// Check if connection is closed
 	// 检查连接是否已关闭
 	isClosed() {
-		return (!this.connection || !this.connection.readyState || this.connection.readyState === WebSocket.CLOSED ? true : false)
+		return (!this.connection || this.connection.readyState === WebSocket.CLOSED ? true : false)
+	}
+
+	stopConnectTimer() {
+		if (this.connectTimer) {
+			clearTimeout(this.connectTimer);
+			this.connectTimer = null
+		}
 	}
 
 	// Start reconnect timer
@@ -543,6 +570,7 @@ class NodeCrypt {
 	disconnect() {
 		this.stopReconnect();
 		this.stopPing();
+		this.stopConnectTimer();
 		if (!this.isClosed()) {
 			try {
 				this.logEvent('disconnect');

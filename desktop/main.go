@@ -36,6 +36,7 @@ func main() {
 	}
 
 	app := NewApp(chatAssets)
+	startDesktopTray(app.showWindow, app.Quit)
 	chatFiles := http.FileServer(http.FS(chatAssets))
 	chatHandler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if !strings.HasPrefix(request.URL.Path, "/chat/") {
@@ -52,8 +53,11 @@ func main() {
 	nodeMenu.AddText("连接本机", keys.CmdOrCtrl("L"), func(_ *menu.CallbackData) {
 		app.ConnectLocal()
 	})
+	nodeMenu.AddText("隐藏到后台", nil, func(_ *menu.CallbackData) {
+		app.HideToBackground()
+	})
 	nodeMenu.AddSeparator()
-	nodeMenu.AddText("退出", keys.CmdOrCtrl("Q"), func(_ *menu.CallbackData) {
+	nodeMenu.AddText("退出程序", keys.CmdOrCtrl("Q"), func(_ *menu.CallbackData) {
 		app.Quit()
 	})
 
@@ -71,6 +75,7 @@ func main() {
 		BackgroundColour: &options.RGBA{R: 243, G: 245, B: 247, A: 1},
 		OnStartup:        app.startup,
 		OnShutdown:       app.shutdown,
+		OnBeforeClose:    app.requestClose,
 		Bind: []interface{}{
 			app,
 		},
@@ -80,6 +85,9 @@ func main() {
 		},
 		SingleInstanceLock: &options.SingleInstanceLock{
 			UniqueId: "com.nodecrypt.desktop",
+			OnSecondInstanceLaunch: func(options.SecondInstanceData) {
+				app.showWindow()
+			},
 		},
 	})
 	if err != nil {

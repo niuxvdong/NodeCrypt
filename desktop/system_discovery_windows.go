@@ -171,12 +171,13 @@ func (d *nativeDNSDiscovery) register(name string, port int) bool {
 	}
 	serviceName, _ := windows.UTF16PtrFromString("NodeCrypt-" + shortID + "." + nodeCryptServiceType)
 	hostName, _ := windows.UTF16PtrFromString("nodecrypt-" + shortID + ".local")
+	localAddresses := localIPv4Addresses()
 	primaryAddress := ""
-	if addresses := localIPv4Addresses(); len(addresses) > 0 {
-		primaryAddress = addresses[0]
+	if len(localAddresses) > 0 {
+		primaryAddress = localAddresses[0]
 	}
-	keys := []string{"nodeId", "nodeName", "nodeAddress"}
-	values := []string{d.localID, name, primaryAddress}
+	keys := []string{"nodeId", "nodeName", "nodeAddress", "nodeAddresses"}
+	values := []string{d.localID, name, primaryAddress, strings.Join(localAddresses, ",")}
 	keyBuffers := make([][]uint16, len(keys))
 	valueBuffers := make([][]uint16, len(values))
 	keyPointers := make([]uintptr, len(keys))
@@ -316,33 +317,33 @@ func dnsResolveCallback(status, context, instancePointer uintptr) uintptr {
 	properties := dnsServiceProperties(instance)
 	info.ID = properties["nodeId"]
 	info.Name = properties["nodeName"]
-	if parsed := net.ParseIP(properties["nodeAddress"]); parsed != nil && parsed.To4() != nil && !parsed.IsUnspecified() && !parsed.IsMulticast() {
-		info.Address = parsed.To4().String()
-	}
 	if info.ID == "" || info.ID == operation.discovery.localID || info.Port < 1 {
 		procDnsServiceFree.Call(instancePointer)
 		return 0
 	}
-	if info.Address == "" && instance.IPv4Address != 0 {
+	addresses := make([]string, 0, 4)
+	if instance.IPv4Address != 0 {
 		raw := *(*[4]byte)(unsafe.Pointer(instance.IPv4Address))
-		info.Address = net.IPv4(raw[0], raw[1], raw[2], raw[3]).String()
+		addresses = append(addresses, net.IPv4(raw[0], raw[1], raw[2], raw[3]).String())
 	}
-	if info.Address == "" && instance.HostName != 0 {
+	if instance.HostName != 0 {
 		hostName := windows.UTF16PtrToString((*uint16)(unsafe.Pointer(instance.HostName)))
-		if addresses, err := net.LookupIP(strings.TrimSuffix(hostName, ".")); err == nil {
-			for _, address := range addresses {
+		if resolvedAddresses, err := net.LookupIP(strings.TrimSuffix(hostName, ".")); err == nil {
+			for _, address := range resolvedAddresses {
 				if address.To4() != nil {
-					info.Address = address.To4().String()
-					break
+					addresses = append(addresses, address.To4().String())
 				}
 			}
 		}
 	}
+	addresses = append(addresses, strings.Split(properties["nodeAddresses"], ",")...)
+	addresses = append(addresses, properties["nodeAddress"])
+	info.Addresses = uniqueIPv4Addresses(addresses)
 	procDnsServiceFree.Call(instancePointer)
-	if info.Address == "" {
+	if len(info.Addresses) == 0 {
 		return 0
 	}
-	info.Addresses = []string{info.Address}
+	info.Address = info.Addresses[0]
 	info.URL = "http://" + net.JoinHostPort(info.Address, strconv.Itoa(info.Port))
 	operation.discovery.onNode(info)
 	return 0

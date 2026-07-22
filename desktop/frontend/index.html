@@ -8,45 +8,90 @@
 </head>
 <body>
 	<header class="topbar">
-		<div class="brand">NodeCrypt Desktop</div>
+		<div class="brand-block">
+			<div class="brand">NodeCrypt Desktop</div>
+			<div class="brand-subtitle">局域网加密聊天</div>
+		</div>
 		<div class="status" id="status">正在发现节点</div>
 	</header>
 	<main>
-		<section class="node-toolbar">
-			<label for="node-name">本机名称</label>
-			<div class="name-control">
-				<input id="node-name" type="text" minlength="2" maxlength="32">
-				<button type="button" id="save-name">保存</button>
-			</div>
-			<button type="button" class="secondary" id="refresh">刷新</button>
-		</section>
-		<section class="network-access">
+		<section class="intro">
 			<div>
-				<div class="network-title">局域网访问</div>
+				<div class="eyebrow">NODE DISCOVERY</div>
+				<h1>连接局域网节点</h1>
+			</div>
+		</section>
+		<div class="overview-grid">
+			<section class="panel identity-panel">
+				<div class="panel-heading">
+					<div>
+						<div class="panel-kicker">本机节点</div>
+						<h2>我的设备</h2>
+					</div>
+					<span class="state-dot">在线</span>
+				</div>
+				<div class="identity-form">
+					<label for="node-name">节点名称</label>
+					<div class="name-control">
+						<input id="node-name" type="text" minlength="2" maxlength="32">
+						<button type="button" id="save-name">保存</button>
+					</div>
+				</div>
+				<div class="local-endpoint">
+					<div class="endpoint-label">局域网地址</div>
+					<div class="endpoint-value" id="local-addresses">正在读取地址…</div>
+				</div>
+			</section>
+			<section class="panel network-panel">
+				<div class="panel-heading">
+					<div>
+						<div class="panel-kicker">网络访问</div>
+						<h2>连接状态</h2>
+					</div>
+					<span class="status-mark" id="network-state">检查中</span>
+				</div>
 				<div class="network-detail" id="network-detail">正在检查网络状态</div>
 				<div class="firewall-rules">TCP 8788–8807 · UDP 42429 · 仅限本地子网</div>
 				<div class="firewall-program" id="firewall-program"></div>
+				<div class="network-actions">
+					<button type="button" class="secondary" id="configure-firewall">添加规则</button>
+					<button type="button" class="danger" id="remove-firewall">删除规则</button>
+				</div>
+			</section>
+		</div>
+		<section class="panel direct-panel">
+			<div class="panel-heading compact">
+				<div>
+					<div class="panel-kicker">快速进入</div>
+					<h2>连接指定节点</h2>
+				</div>
+				<div class="panel-hint">支持 IP、IP:端口或完整房间链接</div>
 			</div>
-			<div class="network-actions">
-				<button type="button" class="secondary" id="configure-firewall">添加规则</button>
-				<button type="button" class="danger" id="remove-firewall">删除规则</button>
-			</div>
-		</section>
-		<section class="direct-connect">
-			<label for="direct-address">节点或房间地址</label>
 			<div class="address-control">
-				<input id="direct-address" type="text" inputmode="url" placeholder="192.168.1.20（默认 8788）或完整房间链接">
-				<button type="button" id="direct-connect">进入</button>
+				<input id="direct-address" type="text" inputmode="url" placeholder="例如 192.168.1.20（默认 8788）">
+				<button type="button" id="direct-connect">进入房间</button>
 			</div>
 			<div class="field-error" id="address-error" role="alert"></div>
 		</section>
 		<section class="recent-rooms" id="recent-rooms" hidden>
 			<div class="section-heading">
-				<div class="section-title">最近房间</div>
+				<div>
+					<div class="panel-kicker">快速返回</div>
+					<div class="section-title">最近房间</div>
+				</div>
 			</div>
 			<div class="recent-room-list" id="recent-room-list"></div>
 		</section>
-		<section class="node-list" id="node-list" aria-live="polite"></section>
+		<section class="nodes-section">
+			<div class="section-heading nodes-heading">
+				<div>
+					<div class="panel-kicker">局域网发现</div>
+					<div class="section-title">可用节点</div>
+				</div>
+				<button type="button" class="secondary refresh-button" id="refresh">刷新节点</button>
+			</div>
+			<section class="node-list" id="node-list" aria-live="polite"></section>
+		</section>
 	</main>
 	<script src="app.js"></script>
 </body>

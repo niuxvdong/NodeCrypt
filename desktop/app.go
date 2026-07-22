@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -22,13 +24,16 @@ import (
 )
 
 type App struct {
-	ctx       context.Context
-	assets    fs.FS
-	server    *ChatServer
-	discovery *DiscoveryService
-	config    desktopConfig
-	configDir string
-	mu        sync.RWMutex
+	ctx             context.Context
+	assets          fs.FS
+	server          *ChatServer
+	discovery       *DiscoveryService
+	config          desktopConfig
+	configDir       string
+	mu              sync.RWMutex
+	quitting        bool
+	networkStatus   NetworkStatus
+	networkStatusAt time.Time
 }
 
 type desktopConfig struct {
@@ -91,12 +96,50 @@ func (a *App) startup(ctx context.Context) {
 }
 
 func (a *App) shutdown(_ context.Context) {
+	stopDesktopTray()
 	if a.discovery != nil {
 		a.discovery.Close()
 	}
 	if a.server != nil {
 		a.server.Close()
 	}
+}
+
+func (a *App) showWindow() {
+	if a.ctx == nil {
+		return
+	}
+	runtime.WindowShow(a.ctx)
+	runtime.WindowUnminimise(a.ctx)
+}
+
+func (a *App) HideToBackground() {
+	if a.ctx != nil {
+		runtime.WindowHide(a.ctx)
+	}
+}
+
+func (a *App) requestClose(ctx context.Context) bool {
+	a.mu.RLock()
+	quitting := a.quitting
+	a.mu.RUnlock()
+	if quitting {
+		return false
+	}
+	answer, err := runtime.MessageDialog(ctx, runtime.MessageDialogOptions{
+		Type:          runtime.QuestionDialog,
+		Title:         "NodeCrypt Desktop",
+		Message:       "是否在后台继续运行？\n\n选择“是”：隐藏窗口，继续提供局域网节点和聊天服务。\n选择“否”：完全退出程序。",
+		DefaultButton: "Yes",
+	})
+	if err != nil || answer == "Yes" {
+		runtime.WindowHide(ctx)
+		return true
+	}
+	a.mu.Lock()
+	a.quitting = true
+	a.mu.Unlock()
+	return false
 }
 
 func (a *App) loadConfig() {
@@ -158,6 +201,13 @@ func (a *App) ListNodes() []NodeInfo {
 }
 
 func localIPv4Addresses() []string {
+	if addresses, handled := platformLocalIPv4Addresses(); handled {
+		return addresses
+	}
+	return genericLocalIPv4Addresses()
+}
+
+func genericLocalIPv4Addresses() []string {
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return nil
@@ -174,7 +224,7 @@ func localIPv4Addresses() []string {
 		}
 		for _, interfaceAddress := range interfaceAddresses {
 			ip, _, err := net.ParseCIDR(interfaceAddress.String())
-			if err != nil || ip.IsLoopback() || ip.To4() == nil {
+			if err != nil || !isUsableLocalIPv4(ip) {
 				continue
 			}
 			address := ip.To4().String()
@@ -193,6 +243,11 @@ func localIPv4Addresses() []string {
 		return addresses[i] < addresses[j]
 	})
 	return addresses
+}
+
+func isUsableLocalIPv4(ip net.IP) bool {
+	return ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsUnspecified() &&
+		!ip.IsMulticast() && !ip.IsLinkLocalUnicast()
 }
 
 func (a *App) SetNodeName(name string) bool {
@@ -217,6 +272,13 @@ func (a *App) RefreshDiscovery() {
 }
 
 func (a *App) GetNetworkStatus() NetworkStatus {
+	a.mu.RLock()
+	if !a.networkStatusAt.IsZero() && time.Since(a.networkStatusAt) < 30*time.Second {
+		status := a.networkStatus
+		a.mu.RUnlock()
+		return status
+	}
+	a.mu.RUnlock()
 	addresses := localIPv4Addresses()
 	primaryIP := ""
 	if len(addresses) > 0 {
@@ -224,6 +286,10 @@ func (a *App) GetNetworkStatus() NetworkStatus {
 	}
 	status := queryWindowsNetworkStatus(primaryIP)
 	status.SystemDiscoveryEnabled = a.discovery != nil && a.discovery.SystemDiscoveryEnabled()
+	a.mu.Lock()
+	a.networkStatus = status
+	a.networkStatusAt = time.Now()
+	a.mu.Unlock()
 	return status
 }
 
@@ -369,17 +435,28 @@ func (a *App) DeleteRecentRoom(id string) bool {
 }
 
 func (a *App) ConfigureFirewall() bool {
-	return requestFirewallConfiguration()
+	configured := requestFirewallConfiguration()
+	a.invalidateNetworkStatus()
+	return configured
 }
 
 func (a *App) RemoveFirewall() bool {
-	return requestFirewallRemoval()
+	removed := requestFirewallRemoval()
+	a.invalidateNetworkStatus()
+	return removed
+}
+
+func (a *App) invalidateNetworkStatus() {
+	a.mu.Lock()
+	a.networkStatusAt = time.Time{}
+	a.mu.Unlock()
 }
 
 func (a *App) ConnectToNode(url string) bool {
 	for _, node := range a.ListNodes() {
 		if node.URL == url {
-			return a.openChat(node.URL)
+			reachableURL, ok := findReachableNodeURL(nodeCandidateURLs(node))
+			return ok && a.openChat(reachableURL)
 		}
 	}
 	return false
@@ -390,7 +467,100 @@ func (a *App) ConnectToAddress(address string) bool {
 	if !ok || a.ctx == nil {
 		return false
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	if !probeNodeEndpoint(ctx, target) {
+		return false
+	}
 	return a.openChat(target)
+}
+
+func nodeCandidateURLs(node NodeInfo) []string {
+	seen := make(map[string]bool)
+	candidates := make([]string, 0, len(node.Addresses)+1)
+	add := func(candidate string) {
+		parsed, err := url.Parse(candidate)
+		if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
+			return
+		}
+		origin := (&url.URL{Scheme: "http", Host: parsed.Host}).String()
+		if !seen[origin] {
+			seen[origin] = true
+			candidates = append(candidates, origin)
+		}
+	}
+	add(node.URL)
+	for _, address := range node.Addresses {
+		if ip := net.ParseIP(address); ip != nil && ip.To4() != nil && node.Port > 0 {
+			add("http://" + net.JoinHostPort(ip.To4().String(), strconv.Itoa(node.Port)))
+		}
+	}
+	return candidates
+}
+
+func findReachableNodeURL(candidates []string) (string, bool) {
+	if len(candidates) == 0 {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	results := make(chan string, len(candidates))
+	for _, candidate := range candidates {
+		go func(candidate string) {
+			if probeNodeEndpoint(ctx, candidate) {
+				results <- candidate
+				return
+			}
+			results <- ""
+		}(candidate)
+	}
+	for range candidates {
+		select {
+		case candidate := <-results:
+			if candidate != "" {
+				return candidate, true
+			}
+		case <-ctx.Done():
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func probeNodeEndpoint(ctx context.Context, endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
+		return false
+	}
+	parsed.Path = "/api/runtime"
+	parsed.RawPath = ""
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return false
+	}
+	dialer := &net.Dialer{Timeout: 1200 * time.Millisecond}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 nil,
+			DialContext:           dialer.DialContext,
+			DisableKeepAlives:     true,
+			ResponseHeaderTimeout: 1200 * time.Millisecond,
+		},
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return false
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return false
+	}
+	var runtimeInfo struct {
+		Mode string `json:"mode"`
+	}
+	return json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&runtimeInfo) == nil && runtimeInfo.Mode == "desktop"
 }
 
 func (a *App) openChat(target string) bool {
@@ -452,6 +622,9 @@ func (a *App) ShowDiscovery() {
 
 func (a *App) Quit() {
 	if a.ctx != nil {
+		a.mu.Lock()
+		a.quitting = true
+		a.mu.Unlock()
 		runtime.Quit(a.ctx)
 	}
 }

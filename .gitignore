@@ -19,6 +19,11 @@ Thumbs.db
 # Build output
 dist/
 build/
+!/desktop/build/
+/desktop/build/*
+!/desktop/build/windows/
+/desktop/build/windows/*
+!/desktop/build/windows/icon.ico
 /release/
 /NodeCrypt-Data/
 

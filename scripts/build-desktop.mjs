@@ -114,6 +114,7 @@ writeFileSync(join(releaseDirectory, 'NodeCrypt-Desktop-README.txt'), `NodeCrypt
 4. Encrypted group history is stored on the selected node and in each desktop user's local SQLite under %APPDATA%\\NodeCrypt Desktop.
 5. Use the native Node menu to return to node discovery.
 6. If LAN connections are blocked, use Configure Firewall and approve the one-time Windows UAC prompt.
+7. Closing the window lets you choose between exiting and running in the system tray; use the tray menu or launch the EXE again to restore the window.
 
 The application needs the Microsoft Edge WebView2 Runtime included with current Windows 10/11 systems.
 Build command: npm run build:desktop
